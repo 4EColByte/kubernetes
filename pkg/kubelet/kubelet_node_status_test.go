@@ -34,6 +34,7 @@ import (
 
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"github.com/google/go-cmp/cmp"
+
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -291,7 +292,7 @@ func TestUpdateNewNodeStatus(t *testing.T) {
 						Architecture:            goruntime.GOARCH,
 						ContainerRuntimeVersion: "test://1.5.0",
 						KubeletVersion:          version.Get().String(),
-						KubeProxyVersion:        "",
+						KubeProxyVersion:        version.Get().String(),
 					},
 					Capacity: v1.ResourceList{
 						v1.ResourceCPU:              *resource.NewMilliQuantity(2000, resource.DecimalSI),
@@ -471,7 +472,7 @@ func TestUpdateExistingNodeStatus(t *testing.T) {
 				Architecture:            goruntime.GOARCH,
 				ContainerRuntimeVersion: "test://1.5.0",
 				KubeletVersion:          version.Get().String(),
-				KubeProxyVersion:        "",
+				KubeProxyVersion:        version.Get().String(),
 			},
 			Capacity: v1.ResourceList{
 				v1.ResourceCPU:              *resource.NewMilliQuantity(2000, resource.DecimalSI),
@@ -677,7 +678,7 @@ func TestUpdateNodeStatusWithRuntimeStateError(t *testing.T) {
 				Architecture:            goruntime.GOARCH,
 				ContainerRuntimeVersion: "test://1.5.0",
 				KubeletVersion:          version.Get().String(),
-				KubeProxyVersion:        "",
+				KubeProxyVersion:        version.Get().String(),
 			},
 			Capacity: v1.ResourceList{
 				v1.ResourceCPU:              *resource.NewMilliQuantity(2000, resource.DecimalSI),
@@ -908,7 +909,7 @@ func TestUpdateNodeStatusWithLease(t *testing.T) {
 				Architecture:            goruntime.GOARCH,
 				ContainerRuntimeVersion: "test://1.5.0",
 				KubeletVersion:          version.Get().String(),
-				KubeProxyVersion:        "",
+				KubeProxyVersion:        version.Get().String(),
 			},
 			Capacity: v1.ResourceList{
 				v1.ResourceCPU:              *resource.NewMilliQuantity(2000, resource.DecimalSI),
@@ -1283,7 +1284,7 @@ func TestFastStatusUpdateOnce(t *testing.T) {
 
 			actions := kubeClient.Actions()
 			if tc.wantPatches == 0 {
-				require.Len(t, actions, 0)
+				require.Empty(t, actions)
 				return
 			}
 
@@ -2732,8 +2733,7 @@ func TestRegisterWithApiServerWithTaint(t *testing.T) {
 		Effect: v1.TaintEffectNoSchedule,
 	}
 
-	require.Equal(t,
-		true,
+	require.True(t,
 		taintutil.TaintExists(got.Spec.Taints, unschedulableTaint),
 		"test unschedulable taint for TaintNodesByCondition")
 }

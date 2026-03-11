@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 /*
 Copyright 2020 The Kubernetes Authors.
@@ -20,6 +19,7 @@ limitations under the License.
 package nodeshutdown
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -37,6 +37,7 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
 	_ "k8s.io/klog/v2/ktesting/init" // activate ktesting command line flags
 	"k8s.io/kubernetes/pkg/apis/scheduling"
@@ -44,8 +45,6 @@ import (
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	"k8s.io/kubernetes/pkg/kubelet/nodeshutdown/systemd"
-	"k8s.io/kubernetes/pkg/kubelet/prober"
-	probetest "k8s.io/kubernetes/pkg/kubelet/prober/testing"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager"
 	"k8s.io/utils/clock"
 	testingclock "k8s.io/utils/clock/testing"
@@ -83,7 +82,7 @@ func (f *fakeDbus) ReloadLogindConf() error {
 	return nil
 }
 
-func (f *fakeDbus) MonitorShutdown() (<-chan bool, error) {
+func (f *fakeDbus) MonitorShutdown(_ klog.Logger) (<-chan bool, error) {
 	return f.shutdownChan, nil
 }
 
@@ -279,7 +278,7 @@ func TestManager(t *testing.T) {
 			overrideSystemInhibitDelay:       time.Duration(5 * time.Second),
 			expectedDidOverrideInhibitDelay:  true,
 			expectedPodToGracePeriodOverride: map[string]int64{"normal-pod-nil-grace-period": 5, "critical-pod-nil-grace-period": 0},
-			expectedError:                    fmt.Errorf("unable to update logind InhibitDelayMaxSec to 30s (ShutdownGracePeriod), current value of InhibitDelayMaxSec (5s) is less than requested ShutdownGracePeriod"),
+			expectedError:                    fmt.Errorf("node shutdown manager was timed out after 5 attempts waiting for logind InhibitDelayMaxSec to update to 30s (ShutdownGracePeriod), current value is 5s"),
 		},
 		{
 			desc:                            "override unsuccessful, zero time",
@@ -288,7 +287,7 @@ func TestManager(t *testing.T) {
 			shutdownGracePeriodCriticalPods: time.Duration(5 * time.Second),
 			systemInhibitDelay:              time.Duration(0 * time.Second),
 			overrideSystemInhibitDelay:      time.Duration(0 * time.Second),
-			expectedError:                   fmt.Errorf("unable to update logind InhibitDelayMaxSec to 5s (ShutdownGracePeriod), current value of InhibitDelayMaxSec (0s) is less than requested ShutdownGracePeriod"),
+			expectedError:                   fmt.Errorf("node shutdown manager was timed out after 5 attempts waiting for logind InhibitDelayMaxSec to update to 5s (ShutdownGracePeriod), current value is 0s"),
 		},
 		{
 			desc:                             "no override, all time to critical pods",
@@ -304,7 +303,7 @@ func TestManager(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.desc, func(t *testing.T) {
-			logger, _ := ktesting.NewTestContext(t)
+			logger, tCtx := ktesting.NewTestContext(t)
 
 			activePodsFunc := func() []*v1.Pod {
 				return tc.activePods
@@ -335,26 +334,24 @@ func TestManager(t *testing.T) {
 			}
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.GracefulNodeShutdown, true)
 
-			proberManager := probetest.FakeManager{}
 			fakeRecorder := &record.FakeRecorder{}
-			fakeVolumeManager := volumemanager.NewFakeVolumeManager([]v1.UniqueVolumeName{}, 0, nil)
+			fakeVolumeManager := volumemanager.NewFakeVolumeManager([]v1.UniqueVolumeName{}, 0, nil, false)
 			nodeRef := &v1.ObjectReference{Kind: "Node", Name: "test", UID: types.UID("test"), Namespace: ""}
 			manager := NewManager(&Config{
 				Logger:                          logger,
-				ProbeManager:                    proberManager,
 				VolumeManager:                   fakeVolumeManager,
 				Recorder:                        fakeRecorder,
 				NodeRef:                         nodeRef,
 				GetPodsFunc:                     activePodsFunc,
 				KillPodFunc:                     killPodsFunc,
-				SyncNodeStatusFunc:              func() {},
+				SyncNodeStatusFunc:              func(context context.Context) {},
 				ShutdownGracePeriodRequested:    tc.shutdownGracePeriodRequested,
 				ShutdownGracePeriodCriticalPods: tc.shutdownGracePeriodCriticalPods,
 				Clock:                           testingclock.NewFakeClock(time.Now()),
 				StateDirectory:                  os.TempDir(),
 			})
 
-			err := manager.Start()
+			err := manager.Start(tCtx)
 			lock.Unlock()
 
 			if tc.expectedError != nil {
@@ -441,20 +438,18 @@ func TestFeatureEnabled(t *testing.T) {
 			}
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, pkgfeatures.GracefulNodeShutdown, tc.featureGateEnabled)
 
-			proberManager := probetest.FakeManager{}
 			fakeRecorder := &record.FakeRecorder{}
-			fakeVolumeManager := volumemanager.NewFakeVolumeManager([]v1.UniqueVolumeName{}, 0, nil)
+			fakeVolumeManager := volumemanager.NewFakeVolumeManager([]v1.UniqueVolumeName{}, 0, nil, false)
 			nodeRef := &v1.ObjectReference{Kind: "Node", Name: "test", UID: types.UID("test"), Namespace: ""}
 
 			manager := NewManager(&Config{
 				Logger:                          logger,
-				ProbeManager:                    proberManager,
 				VolumeManager:                   fakeVolumeManager,
 				Recorder:                        fakeRecorder,
 				NodeRef:                         nodeRef,
 				GetPodsFunc:                     activePodsFunc,
 				KillPodFunc:                     killPodsFunc,
-				SyncNodeStatusFunc:              func() {},
+				SyncNodeStatusFunc:              func(context.Context) {},
 				ShutdownGracePeriodRequested:    tc.shutdownGracePeriodRequested,
 				ShutdownGracePeriodCriticalPods: 0,
 				StateDirectory:                  os.TempDir(),
@@ -465,7 +460,7 @@ func TestFeatureEnabled(t *testing.T) {
 }
 
 func TestRestart(t *testing.T) {
-	logger, _ := ktesting.NewTestContext(t)
+	logger, tCtx := ktesting.NewTestContext(t)
 	systemDbusTmp := systemDbus
 	defer func() {
 		systemDbus = systemDbusTmp
@@ -481,7 +476,7 @@ func TestRestart(t *testing.T) {
 	killPodsFunc := func(pod *v1.Pod, isEvicted bool, gracePeriodOverride *int64, fn func(*v1.PodStatus)) error {
 		return nil
 	}
-	syncNodeStatus := func() {}
+	syncNodeStatus := func(context.Context) {}
 
 	var shutdownChan chan bool
 	var shutdownChanMut sync.Mutex
@@ -500,13 +495,11 @@ func TestRestart(t *testing.T) {
 		return dbus, nil
 	}
 
-	proberManager := probetest.FakeManager{}
 	fakeRecorder := &record.FakeRecorder{}
-	fakeVolumeManager := volumemanager.NewFakeVolumeManager([]v1.UniqueVolumeName{}, 0, nil)
+	fakeVolumeManager := volumemanager.NewFakeVolumeManager([]v1.UniqueVolumeName{}, 0, nil, false)
 	nodeRef := &v1.ObjectReference{Kind: "Node", Name: "test", UID: types.UID("test"), Namespace: ""}
 	manager := NewManager(&Config{
 		Logger:                          logger,
-		ProbeManager:                    proberManager,
 		VolumeManager:                   fakeVolumeManager,
 		Recorder:                        fakeRecorder,
 		NodeRef:                         nodeRef,
@@ -518,7 +511,7 @@ func TestRestart(t *testing.T) {
 		StateDirectory:                  os.TempDir(),
 	})
 
-	err := manager.Start()
+	err := manager.Start(tCtx)
 	lock.Unlock()
 
 	if err != nil {
@@ -540,10 +533,9 @@ func TestRestart(t *testing.T) {
 
 func Test_managerImpl_processShutdownEvent(t *testing.T) {
 	var (
-		probeManager      = probetest.FakeManager{}
 		fakeRecorder      = &record.FakeRecorder{}
-		fakeVolumeManager = volumemanager.NewFakeVolumeManager([]v1.UniqueVolumeName{}, 0, nil)
-		syncNodeStatus    = func() {}
+		fakeVolumeManager = volumemanager.NewFakeVolumeManager([]v1.UniqueVolumeName{}, 0, nil, false)
+		syncNodeStatus    = func(context.Context) {}
 		nodeRef           = &v1.ObjectReference{Kind: "Node", Name: "test", UID: types.UID("test"), Namespace: ""}
 		fakeclock         = testingclock.NewFakeClock(time.Now())
 	)
@@ -551,12 +543,11 @@ func Test_managerImpl_processShutdownEvent(t *testing.T) {
 	type fields struct {
 		recorder                         record.EventRecorder
 		nodeRef                          *v1.ObjectReference
-		probeManager                     prober.Manager
 		volumeManager                    volumemanager.VolumeManager
 		shutdownGracePeriodByPodPriority []kubeletconfig.ShutdownGracePeriodByPodPriority
 		getPods                          eviction.ActivePodsFunc
 		killPodFunc                      eviction.KillPodFunc
-		syncNodeStatus                   func()
+		syncNodeStatus                   func(context.Context)
 		dbusCon                          dbusInhibiter
 		inhibitLock                      systemd.InhibitLock
 		nodeShuttingDownNow              bool
@@ -573,7 +564,6 @@ func Test_managerImpl_processShutdownEvent(t *testing.T) {
 			fields: fields{
 				recorder:      fakeRecorder,
 				nodeRef:       nodeRef,
-				probeManager:  probeManager,
 				volumeManager: fakeVolumeManager,
 				shutdownGracePeriodByPodPriority: []kubeletconfig.ShutdownGracePeriodByPodPriority{
 					{
@@ -615,7 +605,6 @@ func Test_managerImpl_processShutdownEvent(t *testing.T) {
 				logger:                logger,
 				recorder:              tt.fields.recorder,
 				nodeRef:               tt.fields.nodeRef,
-				probeManager:          tt.fields.probeManager,
 				getPods:               tt.fields.getPods,
 				syncNodeStatus:        tt.fields.syncNodeStatus,
 				dbusCon:               tt.fields.dbusCon,
@@ -651,9 +640,8 @@ func Test_managerImpl_processShutdownEvent(t *testing.T) {
 
 func Test_processShutdownEvent_VolumeUnmountTimeout(t *testing.T) {
 	var (
-		probeManager               = probetest.FakeManager{}
 		fakeRecorder               = &record.FakeRecorder{}
-		syncNodeStatus             = func() {}
+		syncNodeStatus             = func(context.Context) {}
 		nodeRef                    = &v1.ObjectReference{Kind: "Node", Name: "test", UID: types.UID("test"), Namespace: ""}
 		fakeclock                  = testingclock.NewFakeClock(time.Now())
 		shutdownGracePeriodSeconds = 2
@@ -663,14 +651,13 @@ func Test_processShutdownEvent_VolumeUnmountTimeout(t *testing.T) {
 		[]v1.UniqueVolumeName{},
 		3*time.Second, // This value is intentionally longer than the shutdownGracePeriodSeconds (2s) to test the behavior
 		// for volume unmount operations that take longer than the allowed grace period.
-		fmt.Errorf("unmount timeout"),
+		fmt.Errorf("unmount timeout"), false,
 	)
 	logger := ktesting.NewLogger(t, ktesting.NewConfig(ktesting.BufferLogs(true)))
 	m := &managerImpl{
-		logger:       logger,
-		recorder:     fakeRecorder,
-		nodeRef:      nodeRef,
-		probeManager: probeManager,
+		logger:   logger,
+		recorder: fakeRecorder,
+		nodeRef:  nodeRef,
 		getPods: func() []*v1.Pod {
 			return []*v1.Pod{
 				makePod("test-pod", 1, nil),

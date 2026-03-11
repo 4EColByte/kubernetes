@@ -52,8 +52,7 @@ import (
 	servicehelper "k8s.io/cloud-provider/service/helpers"
 	_ "k8s.io/controller-manager/pkg/features/register"
 	"k8s.io/klog/v2/ktesting"
-
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 const region = "us-central"
@@ -250,7 +249,7 @@ func TestSyncLoadBalancerIfNeeded(t *testing.T) {
 		expectPatchFinalizer: true,
 	}, {
 		desc:                 "service specifies loadBalancerClass",
-		service:              newService("with-external-balancer", v1.ServiceTypeLoadBalancer, tweakAddLBClass(utilpointer.String("custom-loadbalancer"))),
+		service:              newService("with-external-balancer", v1.ServiceTypeLoadBalancer, tweakAddLBClass(ptr.To("custom-loadbalancer"))),
 		expectOp:             deleteLoadBalancer,
 		expectCreateAttempt:  false,
 		expectPatchStatus:    false,
@@ -308,8 +307,17 @@ func TestSyncLoadBalancerIfNeeded(t *testing.T) {
 				if len(cloud.Calls) > 0 {
 					t.Errorf("Unexpected cloud provider calls: %v", cloud.Calls)
 				}
-				if len(actions) > 0 {
-					t.Errorf("Unexpected client actions: %v", actions)
+				// Ignore watch actions from the informer's reflector (timing-dependent).
+				var nonWatchActions []core.Action
+				for _, a := range actions {
+					if a.GetVerb() != "watch" {
+						nonWatchActions = append(nonWatchActions, a)
+					} else {
+						t.Logf("Ignoring watch action: %v", a)
+					}
+				}
+				if len(nonWatchActions) > 0 {
+					t.Logf("Unexpected client actions: %v", nonWatchActions)
 				}
 				return
 			}

@@ -106,10 +106,13 @@ func (c *Controller) Start(ctx context.Context) {
 	c.eventRecorder = c.eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: controllerName})
 	c.eventBroadcaster.StartStructuredLogging(0)
 	c.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: c.client.CoreV1().Events("")})
-	defer c.eventBroadcaster.Shutdown()
 
 	klog.Infof("Starting %s", controllerName)
-	defer klog.Infof("Shutting down %s", controllerName)
+	go func() {
+		<-ctx.Done()
+		klog.Infof("Shutting down %s", controllerName)
+		c.eventBroadcaster.Shutdown()
+	}()
 
 	go c.serviceCIDRInformer.Run(stopCh)
 	if !cache.WaitForNamedCacheSync(controllerName, stopCh, c.serviceCIDRsSynced) {
@@ -215,7 +218,7 @@ func (c *Controller) syncStatus(serviceCIDR *networkingapiv1.ServiceCIDR) {
 	case currentReadyCondition != nil && currentReadyCondition.Status == metav1.ConditionFalse:
 		if !c.reportedNotReadyCondition {
 			klog.InfoS("Default ServiceCIDR condition Ready is False, but controller configuration matches. Please validate your cluster's network configuration.", "serviceCIDR", klog.KObj(serviceCIDR), "status", currentReadyCondition.Status, "reason", currentReadyCondition.Reason, "message", currentReadyCondition.Message)
-			c.eventRecorder.Eventf(serviceCIDR, v1.EventTypeWarning, currentReadyCondition.Reason, "Configuration matches, but "+currentReadyCondition.Message)
+			c.eventRecorder.Eventf(serviceCIDR, v1.EventTypeWarning, currentReadyCondition.Reason, "Configuration matches, but %s", currentReadyCondition.Message)
 			c.reportedNotReadyCondition = true
 		}
 

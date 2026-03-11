@@ -358,6 +358,11 @@ func (p *ExecOptions) Run() error {
 			return err
 		}
 		containerName = container.Name
+	} else {
+		container, _ := podcmd.FindContainerByName(pod, p.ContainerName)
+		if container == nil {
+			return fmt.Errorf("container %s is not valid for pod %s out of: %s", p.ContainerName, pod.Name, podcmd.AllContainerNames(pod))
+		}
 	}
 
 	// ensure we can recover the terminal while attached
@@ -366,7 +371,9 @@ func (p *ExecOptions) Run() error {
 	var sizeQueue remotecommand.TerminalSizeQueue
 	if t.Raw {
 		// this call spawns a goroutine to monitor/update the terminal size
-		sizeQueue = t.MonitorSize(t.GetSize())
+		sizeQueue = &terminalSizeQueueAdapter{
+			delegate: t.MonitorSize(t.GetSize()),
+		}
 
 		// unset p.Err if it was previously set because both stdout and stderr go over p.Out when tty is
 		// true
@@ -402,4 +409,23 @@ func (p *ExecOptions) Run() error {
 	}
 
 	return nil
+}
+
+type terminalSizeQueueAdapter struct {
+	delegate term.TerminalSizeQueue
+}
+
+func (a *terminalSizeQueueAdapter) Next() *remotecommand.TerminalSize {
+	if a.delegate == nil {
+		return nil
+	}
+
+	next := a.delegate.Next()
+	if next == nil {
+		return nil
+	}
+	return &remotecommand.TerminalSize{
+		Width:  next.Width,
+		Height: next.Height,
+	}
 }

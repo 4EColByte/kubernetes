@@ -24,7 +24,9 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -51,12 +53,14 @@ import (
 	openapicommon "k8s.io/kube-openapi/pkg/common"
 	kubeauthenticator "k8s.io/kubernetes/pkg/kubeapiserver/authenticator"
 	"k8s.io/kubernetes/pkg/serviceaccount"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestAuthenticationValidate(t *testing.T) {
 	testCases := []struct {
 		name                              string
+		clientCert                        *apiserveroptions.ClientCertAuthenticationOptions
+		requestHeader                     *apiserveroptions.RequestHeaderAuthenticationOptions
 		testAnonymous                     *AnonymousAuthenticationOptions
 		testOIDC                          *OIDCAuthenticationOptions
 		testSA                            *ServiceAccountAuthenticationOptions
@@ -255,11 +259,43 @@ func TestAuthenticationValidate(t *testing.T) {
 			// feature-gate, otherwise this feature-gate cannot be disabled.
 			emulationVersion: version.MustParse("1.33"),
 		},
+		{
+			name:       "overlapping CA without allowed-names",
+			clientCert: &apiserveroptions.ClientCertAuthenticationOptions{ClientCA: filepath.Join("testdata", "client-ca.pem")},
+			requestHeader: &apiserveroptions.RequestHeaderAuthenticationOptions{
+				ClientCAFile:    filepath.Join("testdata", "client-ca.pem"),
+				AllowedNames:    []string{},
+				UsernameHeaders: []string{"X-Remote-User"},
+			},
+			expectErr: "--requestheader-client-ca-file and --client-ca-file contain overlapping certificates; --requestheader-allowed-names must be specified to ensure regular client certificates cannot set authenticating proxy headers for arbitrary users",
+		},
+		{
+			name:       "overlapping CA with allowed-names",
+			clientCert: &apiserveroptions.ClientCertAuthenticationOptions{ClientCA: filepath.Join("testdata", "client-ca.pem")},
+			requestHeader: &apiserveroptions.RequestHeaderAuthenticationOptions{
+				ClientCAFile:    filepath.Join("testdata", "client-ca.pem"),
+				AllowedNames:    []string{"Client-CA"},
+				UsernameHeaders: []string{"X-Remote-User"},
+			},
+			expectErr: "",
+		},
+		{
+			name:       "different CAs without allowed-names",
+			clientCert: &apiserveroptions.ClientCertAuthenticationOptions{ClientCA: filepath.Join("testdata", "client-ca.pem")},
+			requestHeader: &apiserveroptions.RequestHeaderAuthenticationOptions{
+				ClientCAFile:    filepath.Join("testdata", "server-ca.pem"),
+				AllowedNames:    []string{},
+				UsernameHeaders: []string{"X-Remote-User"},
+			},
+			expectErr: "",
+		},
 	}
 
 	for _, testcase := range testCases {
 		t.Run(testcase.name, func(t *testing.T) {
 			options := NewBuiltInAuthenticationOptions()
+			options.ClientCert = testcase.clientCert
+			options.RequestHeader = testcase.requestHeader
 			options.Anonymous = testcase.testAnonymous
 			options.OIDC = testcase.testOIDC
 			options.ServiceAccounts = testcase.testSA
@@ -345,7 +381,7 @@ func TestToAuthenticationConfig(t *testing.T) {
 					ClaimMappings: apiserver.ClaimMappings{
 						Username: apiserver.PrefixedClaimOrExpression{
 							Claim:  "sub",
-							Prefix: pointer.String("https://testIssuerURL#"),
+							Prefix: ptr.To("https://testIssuerURL#"),
 						},
 					},
 				},
@@ -561,7 +597,7 @@ anonymous:
   enabled: false
 `),
 			},
-			expectErr: "anonymous is not supported when AnonymousAuthConfigurableEnpoints feature gate is disabled",
+			expectErr: "anonymous is not supported when AnonymousAuthConfigurableEndpoints feature gate is disabled",
 		},
 		{
 			name:                     "file-anonymous-disabled-AnonymousAuthConfigurableEndpoints-enabled",
@@ -731,7 +767,7 @@ jwt:
 							ClaimMappings: apiserver.ClaimMappings{
 								Username: apiserver.PrefixedClaimOrExpression{
 									Claim:  "sub",
-									Prefix: pointer.String(""),
+									Prefix: ptr.To(""),
 								},
 							},
 						},
@@ -799,6 +835,7 @@ func TestToAuthenticationConfig_OIDC(t *testing.T) {
 		name         string
 		args         []string
 		expectConfig kubeauthenticator.Config
+		expectErr    string
 	}{
 		{
 			name: "username prefix is '-'",
@@ -822,7 +859,7 @@ func TestToAuthenticationConfig_OIDC(t *testing.T) {
 							ClaimMappings: apiserver.ClaimMappings{
 								Username: apiserver.PrefixedClaimOrExpression{
 									Claim:  "sub",
-									Prefix: pointer.String(""),
+									Prefix: ptr.To(""),
 								},
 							},
 							ClaimValidationRules: []apiserver.ClaimValidationRule{
@@ -858,7 +895,7 @@ func TestToAuthenticationConfig_OIDC(t *testing.T) {
 							ClaimMappings: apiserver.ClaimMappings{
 								Username: apiserver.PrefixedClaimOrExpression{
 									Claim:  "sub",
-									Prefix: pointer.String("https://testIssuerURL#"),
+									Prefix: ptr.To("https://testIssuerURL#"),
 								},
 							},
 							ClaimValidationRules: []apiserver.ClaimValidationRule{
@@ -894,7 +931,7 @@ func TestToAuthenticationConfig_OIDC(t *testing.T) {
 							ClaimMappings: apiserver.ClaimMappings{
 								Username: apiserver.PrefixedClaimOrExpression{
 									Claim:  "email",
-									Prefix: pointer.String(""),
+									Prefix: ptr.To(""),
 								},
 							},
 							ClaimValidationRules: []apiserver.ClaimValidationRule{
@@ -931,7 +968,7 @@ func TestToAuthenticationConfig_OIDC(t *testing.T) {
 							ClaimMappings: apiserver.ClaimMappings{
 								Username: apiserver.PrefixedClaimOrExpression{
 									Claim:  "sub",
-									Prefix: pointer.String("k8s-"),
+									Prefix: ptr.To("k8s-"),
 								},
 							},
 							ClaimValidationRules: []apiserver.ClaimValidationRule{
@@ -970,11 +1007,11 @@ func TestToAuthenticationConfig_OIDC(t *testing.T) {
 							ClaimMappings: apiserver.ClaimMappings{
 								Username: apiserver.PrefixedClaimOrExpression{
 									Claim:  "sub",
-									Prefix: pointer.String(""),
+									Prefix: ptr.To(""),
 								},
 								Groups: apiserver.PrefixedClaimOrExpression{
 									Claim:  "groups",
-									Prefix: pointer.String("oidc:"),
+									Prefix: ptr.To("oidc:"),
 								},
 							},
 							ClaimValidationRules: []apiserver.ClaimValidationRule{
@@ -1017,7 +1054,7 @@ jwt:
 							ClaimMappings: apiserver.ClaimMappings{
 								Username: apiserver.PrefixedClaimOrExpression{
 									Claim:  "sub",
-									Prefix: pointer.String(""),
+									Prefix: ptr.To(""),
 								},
 							},
 						},
@@ -1038,6 +1075,29 @@ jwt:
 				OIDCSigningAlgs: []string{"ES256", "ES384", "ES512", "PS256", "PS384", "PS512", "RS256", "RS384", "RS512"},
 			},
 		},
+		{
+			name: "authentication config file not found",
+			args: []string{
+				"--authentication-config=nonexistent-file",
+			},
+			expectErr:    fmt.Sprintf(`failed to load authentication configuration from file "nonexistent-file": open nonexistent-file: %s`, getFileNotFoundForOS()),
+			expectConfig: kubeauthenticator.Config{},
+		},
+		{
+			name: "authentication config validation error",
+			args: []string{
+				"--authentication-config=" + writeTempFile(t, `
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+jwt:
+- issuer:
+    url: https://test-issuer
+    audiences: [ "🐼" ]
+`),
+			},
+			expectErr:    "invalid authentication configuration: jwt[0].claimMappings.username: Required value: claim or expression is required",
+			expectConfig: kubeauthenticator.Config{},
+		},
 	}
 
 	for _, testcase := range testCases {
@@ -1051,9 +1111,13 @@ jwt:
 			}
 
 			resultConfig, err := opts.ToAuthenticationConfig()
-			if err != nil {
-				t.Fatal(err)
+			if (err != nil) != (testcase.expectErr != "") {
+				t.Fatalf("Got err: %v; Want err: %v", err, testcase.expectErr)
 			}
+			if len(testcase.expectErr) > 0 && !strings.Contains(err.Error(), testcase.expectErr) {
+				t.Fatalf("Got err: %v; Want err: %v", err, testcase.expectErr)
+			}
+
 			if !reflect.DeepEqual(resultConfig, testcase.expectConfig) {
 				t.Error(cmp.Diff(resultConfig, testcase.expectConfig))
 			}
@@ -1370,7 +1434,7 @@ jwt:
 						ClaimMappings: apiserver.ClaimMappings{
 							Username: apiserver.PrefixedClaimOrExpression{
 								Claim:  "sub",
-								Prefix: pointer.String(""),
+								Prefix: ptr.To(""),
 							},
 						},
 					},
@@ -1446,7 +1510,7 @@ jwt:
 						ClaimMappings: apiserver.ClaimMappings{
 							Username: apiserver.PrefixedClaimOrExpression{
 								Claim:  "sub",
-								Prefix: pointer.String(""),
+								Prefix: ptr.To(""),
 							},
 						},
 					},
@@ -1522,7 +1586,7 @@ jwt:
 						ClaimMappings: apiserver.ClaimMappings{
 							Username: apiserver.PrefixedClaimOrExpression{
 								Claim:  "sub",
-								Prefix: pointer.String(""),
+								Prefix: ptr.To(""),
 							},
 						},
 					},
@@ -1764,4 +1828,15 @@ func (d *dummyPublicKeyGetter) GetCacheAgeMaxSeconds() int {
 
 func (d *dummyPublicKeyGetter) GetPublicKeys(ctx context.Context, keyIDHint string) []serviceaccount.PublicKey {
 	return []serviceaccount.PublicKey{}
+}
+
+// getFileNotFoundForOS returns the expected error message for a file not found error on the current OS
+// - on Windows, the error message is "The system cannot find the file specified"
+// - on other, the error message is "no such file or directory"
+func getFileNotFoundForOS() string {
+	if goruntime.GOOS == "windows" {
+		return "The system cannot find the file specified"
+	} else {
+		return "no such file or directory"
+	}
 }

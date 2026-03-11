@@ -439,20 +439,6 @@ const (
 	//
 	// The annotation is added to a "Bookmark" event.
 	InitialEventsAnnotationKey = "k8s.io/initial-events-end"
-
-	// InitialEventsListBlueprintAnnotationKey is the name of the key
-	// where an empty, versioned list is encoded in the requested format
-	// (e.g., protobuf, JSON, CBOR), then base64-encoded and stored as a string.
-	//
-	// This encoding matches the request encoding format, which may be
-	// protobuf, JSON, CBOR, or others, depending on what the client requested.
-	// This ensures that the reconstructed list can be processed through the
-	// same decoder chain that would handle a standard LIST call response.
-	//
-	// The annotation is added to a "Bookmark" event and is used by clients
-	// to guarantee the format consistency when reconstructing
-	// the list during WatchList processing.
-	InitialEventsListBlueprintAnnotationKey = "kubernetes.io/initial-events-list-blueprint"
 )
 
 // resourceVersionMatch specifies how the resourceVersion parameter is applied. resourceVersionMatch
@@ -798,7 +784,6 @@ type Status struct {
 	// is not guaranteed to conform to any schema except that defined by
 	// the reason type.
 	// +optional
-	// +listType=atomic
 	Details *StatusDetails `json:"details,omitempty" protobuf:"bytes,5,opt,name=details"`
 	// Suggested HTTP return code for this status, 0 if not set.
 	// +optional
@@ -1398,27 +1383,6 @@ const (
 	ManagedFieldsOperationApply  ManagedFieldsOperationType = "Apply"
 	ManagedFieldsOperationUpdate ManagedFieldsOperationType = "Update"
 )
-
-// FieldsV1 stores a set of fields in a data structure like a Trie, in JSON format.
-//
-// Each key is either a '.' representing the field itself, and will always map to an empty set,
-// or a string representing a sub-field or item. The string will follow one of these four formats:
-// 'f:<name>', where <name> is the name of a field in a struct, or key in a map
-// 'v:<value>', where <value> is the exact json formatted value of a list item
-// 'i:<index>', where <index> is position of a item in a list
-// 'k:<keys>', where <keys> is a map of  a list item's key fields to their unique values
-// If a key maps to an empty Fields value, the field that key represents is part of the set.
-//
-// The exact format is defined in sigs.k8s.io/structured-merge-diff
-// +protobuf.options.(gogoproto.goproto_stringer)=false
-type FieldsV1 struct {
-	// Raw is the underlying serialization of this object.
-	Raw []byte `json:"-" protobuf:"bytes,1,opt,name=Raw"`
-}
-
-func (f FieldsV1) String() string {
-	return string(f.Raw)
-}
 
 // TODO: Table does not generate to protobuf because of the interface{} - fix protobuf
 //   generation to support a meta type that can accept any valid JSON. This can be introduced

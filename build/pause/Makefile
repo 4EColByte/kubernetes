@@ -17,7 +17,7 @@
 REGISTRY ?= staging-k8s.gcr.io
 IMAGE = $(REGISTRY)/pause
 
-TAG ?= 3.10.1
+TAG ?= 3.10.2
 REV = $(shell git describe --contains --always --match='v*')
 
 # Architectures supported: amd64, arm, arm64, ppc64le and s390x
@@ -32,15 +32,17 @@ OUTPUT_TYPE ?= docker
 BASE.linux := scratch
 # Source for windows pause image base is located at https://github.com/microsoft/windows-pause-image-base
 # BASE.windows includes separate manifests per os.version.
-BASE.windows := mcr.microsoft.com/oss/kubernetes/windows-pause-image-base:v0.4.1@sha256:37cc10768383b55611d724a05eb18564cb5184c89b0c2faa7d4eff63475092df
+BASE.windows := mcr.microsoft.com/oss/v2/kubernetes/windows-pause-image-base:v0.4.1@sha256:ba474944e82cac8913e0a402c7727c35d469977026b636bf460f0d52112c4e4f
 BASE := ${BASE.${OS}}
+
+JQ_IMAGE := ghcr.io/jqlang/jq@sha256:a186dcd84a1e28bb48cdf3d7768b890d08621a87bb651fadb7db6815a6bf5ad5
 
 ALL_OS = linux windows
 ALL_ARCH.linux = amd64 arm arm64 ppc64le s390x
 ALL_OS_ARCH.linux = $(foreach arch, ${ALL_ARCH.linux}, linux-$(arch))
 ALL_ARCH.windows = amd64
 # ALL_OSVERSIONS lists all os.versions in BASE.windows.
-ALL_OSVERSIONS.windows := $(shell docker manifest inspect ${BASE.windows} | jq '.manifests' | jq -c '.[]' | jq '.platform."os.version"' | tr -d '"')
+ALL_OSVERSIONS.windows := $(shell docker manifest inspect ${BASE.windows} | docker run --rm -i ${JQ_IMAGE} '.manifests | .[] | .platform."os.version"' | tr -d '"')
 ALL_OS_ARCH.windows = $(foreach arch, $(ALL_ARCH.windows), $(foreach osversion, ${ALL_OSVERSIONS.windows}, windows-$(arch)-${osversion}))
 ALL_OS_ARCH = $(foreach os, $(ALL_OS), ${ALL_OS_ARCH.${os}})
 
@@ -130,9 +132,9 @@ container: .container-${OS}-$(ARCH)
 .container-windows-$(ARCH): $(foreach binary, ${BIN}, bin/${binary}-${OS}-${ARCH})
 	# For Windows images, each "os.version" maps to a specific image "digest" that serves as a base to build corresponding windows-pause image variant.
 	set -x; \
-	image_manifests=$$(docker manifest inspect "${BASE.windows}" | jq '.manifests'); \
+	image_manifests=$$(docker manifest inspect "${BASE.windows}" | docker run --rm -i ${JQ_IMAGE} '.manifests'); \
 	for osversion in $(ALL_OSVERSIONS.windows); do \
-			digest=$$(echo "$${image_manifests}" | jq -r '.[]|select(.platform."os.version" | contains("'$${osversion}'"))' | jq '.digest' | awk -F\" '{print $$2}'); \
+			digest=$$(echo "$${image_manifests}" | docker run --rm -i ${JQ_IMAGE} '.[]|select(.platform."os.version" | contains("'$${osversion}'")) | .digest' | awk -F\" '{print $$2}'); \
 			base_image=$$(echo "${BASE.windows}" | awk -F: '{print $$1}')@$${digest}; \
 			docker buildx build --provenance=false --sbom=false --pull --output=type=${OUTPUT_TYPE} --platform ${OS}/$(ARCH) \
 							-t $(IMAGE):$(TAG)-${OS}-$(ARCH)-$${osversion} --build-arg BASE=$${base_image} --build-arg ARCH=$(ARCH) -f Dockerfile_windows .; \

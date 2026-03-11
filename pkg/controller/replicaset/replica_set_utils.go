@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"time"
 
 	"k8s.io/klog/v2"
 
@@ -92,7 +93,7 @@ func updateReplicaSetStatus(logger klog.Logger, c appsclient.ReplicaSetInterface
 	return nil, updateErr
 }
 
-func calculateStatus(rs *apps.ReplicaSet, activePods []*v1.Pod, terminatingPods []*v1.Pod, manageReplicasErr error, controllerFeatures ReplicaSetControllerFeatures) apps.ReplicaSetStatus {
+func calculateStatus(rs *apps.ReplicaSet, activePods []*v1.Pod, terminatingPods []*v1.Pod, manageReplicasErr error, controllerFeatures ReplicaSetControllerFeatures, now time.Time) apps.ReplicaSetStatus {
 	newStatus := rs.Status
 	// Count the number of pods that have labels matching the labels of the pod
 	// template of the replica set, the matching pods may have more
@@ -109,7 +110,7 @@ func calculateStatus(rs *apps.ReplicaSet, activePods []*v1.Pod, terminatingPods 
 		}
 		if podutil.IsPodReady(pod) {
 			readyReplicasCount++
-			if podutil.IsPodAvailable(pod, rs.Spec.MinReadySeconds, metav1.Now()) {
+			if podutil.IsPodAvailable(pod, rs.Spec.MinReadySeconds, metav1.Time{Time: now}) {
 				availableReplicasCount++
 			}
 		}

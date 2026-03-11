@@ -21,11 +21,16 @@ import (
 	"strings"
 
 	apimachineryvalidation "k8s.io/apimachinery/pkg/api/validation"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	apivalidation "k8s.io/kubernetes/pkg/apis/core/validation"
 	"k8s.io/kubernetes/pkg/apis/scheduling"
 	schedulingapiv1 "k8s.io/kubernetes/pkg/apis/scheduling/v1"
 )
+
+// validateWorkloadName can be used to check whether the given
+// name for a Workload is valid.
+var validateWorkloadName = apimachineryvalidation.NameIsDNSSubdomain
 
 // ValidatePriorityClass tests whether required fields in the PriorityClass are
 // set correctly.
@@ -59,5 +64,50 @@ func ValidatePriorityClassUpdate(pc, oldPc *scheduling.PriorityClass) field.Erro
 	}
 	// preemptionPolicy is immutable.
 	allErrs = append(allErrs, apivalidation.ValidateImmutableField(pc.PreemptionPolicy, oldPc.PreemptionPolicy, field.NewPath("preemptionPolicy"))...)
+	return allErrs
+}
+
+// ValidatePodGroup tests if all fields in a PodGroup are set correctly.
+func ValidatePodGroup(podGroup *scheduling.PodGroup) field.ErrorList {
+	return apivalidation.ValidateObjectMeta(&podGroup.ObjectMeta, true, apivalidation.ValidatePodGroupName, field.NewPath("metadata"))
+}
+
+// ValidatePodGroupUpdate tests if an update to PodGroup is valid.
+func ValidatePodGroupUpdate(podGroup, oldPodGroup *scheduling.PodGroup) field.ErrorList {
+	allErrs := apivalidation.ValidateObjectMetaUpdate(&podGroup.ObjectMeta, &oldPodGroup.ObjectMeta, field.NewPath("metadata"))
+	allErrs = append(allErrs, validatePodGroupSpecUpdate(&podGroup.Spec, &oldPodGroup.Spec, field.NewPath("spec"))...)
+	return allErrs
+}
+
+func validatePodGroupSpecUpdate(spec, oldSpec *scheduling.PodGroupSpec, fldPath *field.Path) field.ErrorList {
+	allErrs := apivalidation.ValidateImmutableField(spec.PodGroupTemplateRef, oldSpec.PodGroupTemplateRef, fldPath.Child("podGroupTemplateRef")).WithOrigin("immutable").MarkCoveredByDeclarative()
+	allErrs = append(allErrs, apivalidation.ValidateImmutableField(spec.SchedulingPolicy, oldSpec.SchedulingPolicy, fldPath.Child("schedulingPolicy")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	return allErrs
+}
+
+// ValidateWorkload tests if all fields in a Workload are set correctly.
+func ValidateWorkload(workload *scheduling.Workload) field.ErrorList {
+	return apivalidation.ValidateObjectMeta(&workload.ObjectMeta, true, validateWorkloadName, field.NewPath("metadata"))
+}
+
+// ValidateWorkloadUpdate tests if an update to Workload is valid.
+func ValidateWorkloadUpdate(workload, oldWorkload *scheduling.Workload) field.ErrorList {
+	allErrs := apivalidation.ValidateObjectMetaUpdate(&workload.ObjectMeta, &oldWorkload.ObjectMeta, field.NewPath("metadata"))
+	allErrs = append(allErrs, validateWorkloadSpecUpdate(&workload.Spec, &oldWorkload.Spec, field.NewPath("spec"))...)
+	return allErrs
+}
+
+func validateWorkloadSpecUpdate(spec, oldSpec *scheduling.WorkloadSpec, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+	allErrs = append(allErrs, apimachineryvalidation.ValidateImmutableField(spec.ControllerRef, oldSpec.ControllerRef, fldPath.Child("controllerRef")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	allErrs = append(allErrs, apivalidation.ValidateImmutableField(spec.PodGroupTemplates, oldSpec.PodGroupTemplates, fldPath.Child("podGroupTemplates")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	return allErrs
+}
+
+// ValidatePodGroupStatusUpdate tests if an update to the status of a PodGroup is valid.
+func ValidatePodGroupStatusUpdate(podGroup, oldPodGroup *scheduling.PodGroup) field.ErrorList {
+	allErrs := apivalidation.ValidateObjectMetaUpdate(&podGroup.ObjectMeta, &oldPodGroup.ObjectMeta, field.NewPath("metadata"))
+	fldPath := field.NewPath("status")
+	allErrs = append(allErrs, metav1validation.ValidateConditions(podGroup.Status.Conditions, fldPath.Child("conditions"))...)
 	return allErrs
 }

@@ -199,20 +199,26 @@ func NewHorizontalController(
 // Run begins watching and syncing.
 func (a *HorizontalController) Run(ctx context.Context, workers int) {
 	defer utilruntime.HandleCrash()
-	defer a.queue.ShutDown()
 
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting HPA controller")
-	defer logger.Info("Shutting down HPA controller")
 
-	if !cache.WaitForNamedCacheSync("HPA", ctx.Done(), a.hpaListerSynced, a.podListerSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down HPA controller")
+		a.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, a.hpaListerSynced, a.podListerSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, a.worker, time.Second)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, a.worker, time.Second)
+		})
 	}
-
 	<-ctx.Done()
 }
 
@@ -241,6 +247,8 @@ func (a *HorizontalController) enqueueHPA(obj interface{}) {
 	defer a.hpaSelectorsMux.Unlock()
 	if hpaKey := selectors.Parse(key); !a.hpaSelectors.SelectorExists(hpaKey) {
 		a.hpaSelectors.PutSelector(hpaKey, labels.Nothing())
+		// Observe HPA addition - only when it's a new HPA
+		a.monitor.ObserveHPAAddition()
 	}
 }
 
@@ -258,6 +266,8 @@ func (a *HorizontalController) deleteHPA(obj interface{}) {
 	a.hpaSelectorsMux.Lock()
 	defer a.hpaSelectorsMux.Unlock()
 	a.hpaSelectors.DeleteSelector(selectors.Parse(key))
+	// Observe HPA deletion
+	a.monitor.ObserveHPADeletion()
 }
 
 func (a *HorizontalController) worker(ctx context.Context) {
@@ -606,8 +616,9 @@ func (a *HorizontalController) computeStatusForResourceMetricGeneric(ctx context
 			return 0, nil, time.Time{}, "", condition, fmt.Errorf("failed to get %s usage: %v", resourceName, err)
 		}
 		metricNameProposal = fmt.Sprintf("%s resource", resourceName.String())
+		quantity := buildQuantity(resourceName, rawProposal)
 		status := autoscalingv2.MetricValueStatus{
-			AverageValue: resource.NewMilliQuantity(rawProposal, resource.DecimalSI),
+			AverageValue: &quantity,
 		}
 		return replicaCountProposal, &status, timestampProposal, metricNameProposal, autoscalingv2.HorizontalPodAutoscalerCondition{}, nil
 	}
@@ -627,11 +638,26 @@ func (a *HorizontalController) computeStatusForResourceMetricGeneric(ctx context
 	if sourceType == autoscalingv2.ContainerResourceMetricSourceType {
 		metricNameProposal = fmt.Sprintf("%s container resource utilization (percentage of request)", resourceName)
 	}
+	quantity := buildQuantity(resourceName, rawProposal)
 	status := autoscalingv2.MetricValueStatus{
 		AverageUtilization: &percentageProposal,
-		AverageValue:       resource.NewMilliQuantity(rawProposal, resource.DecimalSI),
+		AverageValue:       &quantity,
 	}
 	return replicaCountProposal, &status, timestampProposal, metricNameProposal, autoscalingv2.HorizontalPodAutoscalerCondition{}, nil
+}
+
+// buildQuantity creates a resource.Quantity for HPA metrics based on the resource type.
+//
+// For memory, rawProposal is expected in bytes and uses BinarySI formatting (Ki/Mi/Gi).
+// For CPU or other resources, rawProposal is expected in milli-units (e.g., 500 = 0.5 cores) and uses DecimalSI formatting (m).
+func buildQuantity(resourceName v1.ResourceName, rawProposal int64) resource.Quantity {
+	format := resource.DecimalSI
+	// to match what we return in the metrics server,
+	// see https://github.com/kubernetes-sigs/metrics-server/blob/55b4961bc1eceffd0a37809dc271e9ae38de9deb/pkg/storage/types.go#L63-L64
+	if resourceName == v1.ResourceMemory {
+		format = resource.BinarySI
+	}
+	return *resource.NewMilliQuantity(rawProposal, format)
 }
 
 // computeStatusForResourceMetric computes the desired number of replicas for the specified metric of type ResourceMetricSourceType.
@@ -920,14 +946,21 @@ func (a *HorizontalController) reconcileAutoscaler(ctx context.Context, hpaShare
 			actionLabel = monitor.ActionLabelScaleDown
 		}
 	} else {
+		lastScaleTime := ""
+		if hpa.Status.LastScaleTime != nil {
+			lastScaleTime = hpa.Status.LastScaleTime.String()
+		}
 		logger.V(4).Info("Decided not to scale",
 			"scaleTarget", reference,
 			"desiredReplicas", desiredReplicas,
-			"lastScaleTime", hpa.Status.LastScaleTime)
+			"lastScaleTime", lastScaleTime)
 		desiredReplicas = currentReplicas
 	}
 
 	a.setStatus(hpa, currentReplicas, desiredReplicas, metricStatuses, rescale)
+
+	// Monitor the desired replicas
+	a.monitor.ObserveDesiredReplicas(hpa.Namespace, hpa.Name, desiredReplicas)
 
 	err = a.updateStatusIfNeeded(ctx, hpaStatusOriginal, hpa)
 	if err != nil {

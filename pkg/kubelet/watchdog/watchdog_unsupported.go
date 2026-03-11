@@ -1,5 +1,4 @@
 //go:build !linux
-// +build !linux
 
 /*
 Copyright 2024 The Kubernetes Authors.
@@ -21,7 +20,9 @@ package watchdog
 
 import (
 	"context"
+
 	"k8s.io/apiserver/pkg/server/healthz"
+	"k8s.io/klog/v2"
 )
 
 type healthCheckerUnsupported struct{}
@@ -30,15 +31,18 @@ var _ HealthChecker = &healthCheckerUnsupported{}
 
 type Option func(*healthCheckerUnsupported)
 
-func WithExtendedCheckers(checkers []healthz.HealthChecker) Option {
+func WithExtendedCheckers([]healthz.HealthChecker) Option {
 	return nil
 }
 
 // NewHealthChecker creates a fake one here
-func NewHealthChecker(_ syncLoopHealthChecker, _ ...Option) (HealthChecker, error) {
+func NewHealthChecker(klog.Logger, ...Option) (HealthChecker, error) {
 	return &healthCheckerUnsupported{}, nil
 }
 
-func (ow *healthCheckerUnsupported) Start(ctx context.Context) {
+func (hc *healthCheckerUnsupported) SetHealthCheckers(syncLoop syncLoopHealthChecker, checkers []healthz.HealthChecker) {
+}
+
+func (ow *healthCheckerUnsupported) Start(context.Context) {
 	return
 }

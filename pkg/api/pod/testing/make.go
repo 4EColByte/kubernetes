@@ -250,6 +250,12 @@ func SetObjectMeta(objectMeta metav1.ObjectMeta) Tweak {
 	}
 }
 
+func SetSchedulingGroup(schedulingGroup *api.PodSchedulingGroup) Tweak {
+	return func(pod *api.Pod) {
+		pod.Spec.SchedulingGroup = schedulingGroup
+	}
+}
+
 func MakeContainer(name string, tweaks ...TweakContainer) api.Container {
 	cnr := api.Container{
 		Name: name, Image: "image", ImagePullPolicy: "IfNotPresent",

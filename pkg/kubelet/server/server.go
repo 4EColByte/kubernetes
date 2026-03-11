@@ -56,9 +56,13 @@ import (
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/server/flagz"
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/apiserver/pkg/server/httplog"
+
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 	"k8s.io/apiserver/pkg/server/routes"
+	"k8s.io/apiserver/pkg/server/statusz"
 	"k8s.io/apiserver/pkg/util/compatibility"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/apiserver/pkg/util/flushwriter"
@@ -69,8 +73,6 @@ import (
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/prometheus/slis"
 	zpagesfeatures "k8s.io/component-base/zpages/features"
-	"k8s.io/component-base/zpages/flagz"
-	"k8s.io/component-base/zpages/statusz"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/cri-client/pkg/util"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
@@ -130,9 +132,11 @@ type Server struct {
 
 // TLSOptions holds the TLS options.
 type TLSOptions struct {
-	Config   *tls.Config
-	CertFile string
-	KeyFile  string
+	MinVersion   uint16
+	CipherSuites []uint16
+	CertFile     string
+	KeyFile      string
+	ClientCAFile string
 }
 
 // containerInterface defines the restful.Container functions used on the root container
@@ -166,23 +170,22 @@ func (a *filteringContainer) RegisteredHandlePaths() []string {
 
 // ListenAndServeKubeletServer initializes a server to respond to HTTP network requests on the Kubelet.
 func ListenAndServeKubeletServer(
+	ctx context.Context,
 	host HostInterface,
 	resourceAnalyzer stats.ResourceAnalyzer,
 	checkers []healthz.HealthChecker,
 	flagz flagz.Reader,
 	kubeCfg *kubeletconfiginternal.KubeletConfiguration,
-	tlsOptions *TLSOptions,
+	tlsConfig *tls.Config,
 	auth AuthInterface,
 	tp oteltrace.TracerProvider) {
 
 	address := netutils.ParseIPSloppy(kubeCfg.Address)
 	port := uint(kubeCfg.Port)
-	klog.InfoS("Starting to listen", "address", address, "port", port)
-	handler := NewServer(host, resourceAnalyzer, checkers, flagz, auth, kubeCfg)
-
-	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletTracing) {
-		handler.InstallTracingFilter(tp)
-	}
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting to listen", "address", address, "port", port)
+	handler := NewServer(ctx, host, resourceAnalyzer, checkers, flagz, auth, kubeCfg)
+	handler.InstallTracingFilter(tp)
 
 	s := &http.Server{
 		Addr:           net.JoinHostPort(address.String(), strconv.FormatUint(uint64(port), 10)),
@@ -193,23 +196,23 @@ func ListenAndServeKubeletServer(
 		MaxHeaderBytes: 1 << 20,
 	}
 
-	if tlsOptions != nil {
-		s.TLSConfig = tlsOptions.Config
-		// Passing empty strings as the cert and key files means no
-		// cert/keys are specified and GetCertificate in the TLSConfig
-		// should be called instead.
-		if err := s.ListenAndServeTLS(tlsOptions.CertFile, tlsOptions.KeyFile); err != nil {
-			klog.ErrorS(err, "Failed to listen and serve")
+	if tlsConfig != nil {
+		s.TLSConfig = tlsConfig
+		if err := s.ListenAndServeTLS("", ""); err != nil {
+			logger.Error(err, "Failed to listen and serve")
 			os.Exit(1)
 		}
+
+		// support a hollow node with plain HTTP
 	} else if err := s.ListenAndServe(); err != nil {
-		klog.ErrorS(err, "Failed to listen and serve")
+		logger.Error(err, "Failed to listen and serve")
 		os.Exit(1)
 	}
 }
 
 // ListenAndServeKubeletReadOnlyServer initializes a server to respond to HTTP network requests on the Kubelet.
 func ListenAndServeKubeletReadOnlyServer(
+	ctx context.Context,
 	host HostInterface,
 	resourceAnalyzer stats.ResourceAnalyzer,
 	checkers []healthz.HealthChecker,
@@ -217,12 +220,10 @@ func ListenAndServeKubeletReadOnlyServer(
 	address net.IP,
 	port uint,
 	tp oteltrace.TracerProvider) {
-	klog.InfoS("Starting to listen read-only", "address", address, "port", port)
-	s := NewServer(host, resourceAnalyzer, checkers, nil, nil, nil)
-
-	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletTracing) {
-		s.InstallTracingFilter(tp, otelrestful.WithPublicEndpoint())
-	}
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting to listen read-only", "address", address, "port", port)
+	s := NewServer(ctx, host, resourceAnalyzer, checkers, nil, nil, nil)
+	s.InstallTracingFilter(tp, otelrestful.WithPublicEndpoint())
 
 	server := &http.Server{
 		Addr:           net.JoinHostPort(address.String(), strconv.FormatUint(uint64(port), 10)),
@@ -234,33 +235,34 @@ func ListenAndServeKubeletReadOnlyServer(
 	}
 
 	if err := server.ListenAndServe(); err != nil {
-		klog.ErrorS(err, "Failed to listen and serve")
+		logger.Error(err, "Failed to listen and serve")
 		os.Exit(1)
 	}
 }
 
 // ListenAndServePodResources initializes a gRPC server to serve the PodResources service
-func ListenAndServePodResources(endpoint string, providers podresources.PodResourcesProviders) {
-	server := grpc.NewServer(apisgrpc.WithRateLimiter("podresources", podresources.DefaultQPS, podresources.DefaultBurstTokens))
+func ListenAndServePodResources(ctx context.Context, endpoint string, providers podresources.PodResourcesProviders) {
+	logger := klog.FromContext(ctx)
+	server := grpc.NewServer(apisgrpc.WithRateLimiter(ctx, "podresources", podresources.DefaultQPS, podresources.DefaultBurstTokens))
 
 	podresourcesapiv1alpha1.RegisterPodResourcesListerServer(server, podresources.NewV1alpha1PodResourcesServer(providers))
-	podresourcesapi.RegisterPodResourcesListerServer(server, podresources.NewV1PodResourcesServer(providers))
+	podresourcesapi.RegisterPodResourcesListerServer(server, podresources.NewV1PodResourcesServer(ctx, providers))
 
 	l, err := util.CreateListener(endpoint)
 	if err != nil {
-		klog.ErrorS(err, "Failed to create listener for podResources endpoint")
+		logger.Error(err, "Failed to create listener for podResources endpoint")
 		os.Exit(1)
 	}
 
-	klog.InfoS("Starting to serve the podresources API", "endpoint", endpoint)
+	logger.Info("Starting to serve the podresources API", "endpoint", endpoint)
 	if err := server.Serve(l); err != nil {
-		klog.ErrorS(err, "Failed to serve")
+		logger.Error(err, "Failed to serve")
 		os.Exit(1)
 	}
 }
 
 type NodeRequestAttributesGetter interface {
-	GetRequestAttributes(u user.Info, r *http.Request) []authorizer.Attributes
+	GetRequestAttributes(ctx context.Context, u user.Info, r *http.Request) []authorizer.Attributes
 }
 
 // AuthInterface contains all methods required by the auth filters
@@ -268,6 +270,7 @@ type AuthInterface interface {
 	authenticator.Request
 	NodeRequestAttributesGetter
 	authorizer.Authorizer
+	dynamiccertificates.CAContentProvider
 }
 
 // HostInterface contains all the kubelet methods required by the server.
@@ -291,6 +294,7 @@ type HostInterface interface {
 
 // NewServer initializes and configures a kubelet.Server object to handle HTTP requests.
 func NewServer(
+	ctx context.Context,
 	host HostInterface,
 	resourceAnalyzer stats.ResourceAnalyzer,
 	checkers []healthz.HealthChecker,
@@ -298,6 +302,7 @@ func NewServer(
 	auth AuthInterface,
 	kubeCfg *kubeletconfiginternal.KubeletConfiguration) Server {
 
+	logger := klog.FromContext(ctx)
 	server := Server{
 		flagz:                flagz,
 		host:                 host,
@@ -309,30 +314,33 @@ func NewServer(
 		extendedCheckers:     checkers,
 	}
 	if auth != nil {
-		server.InstallAuthFilter()
+		server.InstallAuthFilter(ctx)
 	}
-	server.InstallAuthNotRequiredHandlers()
+	server.InstallAuthNotRequiredHandlers(ctx)
 	if kubeCfg != nil && kubeCfg.EnableDebuggingHandlers {
-		klog.InfoS("Adding debug handlers to kubelet server")
-		server.InstallAuthRequiredHandlers()
+		logger.Info("Adding debug handlers to kubelet server")
 		// To maintain backward compatibility serve logs and pprof only when enableDebuggingHandlers is also enabled
 		// see https://github.com/kubernetes/kubernetes/pull/87273
 		server.InstallSystemLogHandler(kubeCfg.EnableSystemLogHandler, kubeCfg.EnableSystemLogQuery)
 		server.InstallProfilingHandler(kubeCfg.EnableProfilingHandler, kubeCfg.EnableContentionProfiling)
 		server.InstallDebugFlagsHandler(kubeCfg.EnableDebugFlagsHandler)
+		// must be done last so all paths are included in /statusz
+		server.InstallAuthRequiredHandlers(ctx)
 	} else {
 		server.InstallDebuggingDisabledHandlers()
 	}
+
 	return server
 }
 
 // InstallAuthFilter installs authentication filters with the restful Container.
-func (s *Server) InstallAuthFilter() {
+func (s *Server) InstallAuthFilter(ctx context.Context) {
+	logger := klog.FromContext(ctx)
 	s.restfulCont.Filter(func(req *restful.Request, resp *restful.Response, chain *restful.FilterChain) {
 		// Authenticate
 		info, ok, err := s.auth.AuthenticateRequest(req.Request)
 		if err != nil {
-			klog.ErrorS(err, "Unable to authenticate the request due to an error")
+			logger.Error(err, "Unable to authenticate the request due to an error")
 			resp.WriteErrorString(http.StatusUnauthorized, "Unauthorized")
 			return
 		}
@@ -342,7 +350,7 @@ func (s *Server) InstallAuthFilter() {
 		}
 
 		// Get authorization attributes
-		attrs := s.auth.GetRequestAttributes(info.User, req.Request)
+		attrs := s.auth.GetRequestAttributes(ctx, info.User, req.Request)
 		var allowed bool
 		var msg string
 		var subresources []string
@@ -350,7 +358,7 @@ func (s *Server) InstallAuthFilter() {
 			subresources = append(subresources, attr.GetSubresource())
 			decision, _, err := s.auth.Authorize(req.Request.Context(), attr)
 			if err != nil {
-				klog.ErrorS(err, "Authorization error", "user", attr.GetUser().GetName(), "verb", attr.GetVerb(), "resource", attr.GetResource(), "subresource", attr.GetSubresource())
+				logger.Error(err, "Authorization error", "user", attr.GetUser().GetName(), "verb", attr.GetVerb(), "resource", attr.GetResource(), "subresource", attr.GetSubresource())
 				msg = fmt.Sprintf("Authorization error (user=%s, verb=%s, resource=%s, subresource=%s)", attr.GetUser().GetName(), attr.GetVerb(), attr.GetResource(), attr.GetSubresource())
 				resp.WriteErrorString(http.StatusInternalServerError, msg)
 				return
@@ -365,12 +373,12 @@ func (s *Server) InstallAuthFilter() {
 
 		if !allowed {
 			if len(attrs) == 0 {
-				klog.ErrorS(fmt.Errorf("could not determine attributes for request"), "Authorization error")
+				logger.Error(fmt.Errorf("could not determine attributes for request"), "Authorization error")
 				resp.WriteErrorString(http.StatusForbidden, "Authorization error: could not determine attributes for request")
 				return
 			}
 			// The attributes only differ by subresource so we just use the first one.
-			klog.V(2).InfoS("Forbidden", "user", attrs[0].GetUser().GetName(), "verb", attrs[0].GetVerb(), "resource", attrs[0].GetResource(), "subresource(s)", subresources)
+			logger.V(2).Info("Forbidden", "user", attrs[0].GetUser().GetName(), "verb", attrs[0].GetVerb(), "resource", attrs[0].GetResource(), "subresource(s)", subresources)
 			resp.WriteErrorString(http.StatusForbidden, fmt.Sprintf("Forbidden (user=%s, verb=%s, resource=%s, subresource(s)=%v)\n", attrs[0].GetUser().GetName(), attrs[0].GetVerb(), attrs[0].GetResource(), subresources))
 			return
 		}
@@ -383,6 +391,20 @@ func (s *Server) InstallAuthFilter() {
 // InstallTracingFilter installs OpenTelemetry tracing filter with the restful Container.
 func (s *Server) InstallTracingFilter(tp oteltrace.TracerProvider, opts ...otelrestful.Option) {
 	s.restfulCont.Filter(otelrestful.OTelFilter("kubelet", append(opts, otelrestful.WithTracerProvider(tp))...))
+}
+
+func (s *Server) InstallZPages() {
+	if utilfeature.DefaultFeatureGate.Enabled(zpagesfeatures.ComponentFlagz) {
+		if s.flagz != nil {
+			s.addMetricsBucketMatcher("flagz")
+			flagz.Install(s.restfulCont, ComponentKubelet, s.flagz)
+		}
+	}
+	// must be done last so all paths are included in /statusz
+	if utilfeature.DefaultFeatureGate.Enabled(zpagesfeatures.ComponentStatusz) {
+		s.addMetricsBucketMatcher("statusz")
+		statusz.Install(s.restfulCont, ComponentKubelet, statusz.NewRegistry(compatibility.DefaultBuildEffectiveVersion(), statusz.WithListedPaths(s.restfulCont.RegisteredHandlePaths())))
+	}
 }
 
 // addMetricsBucketMatcher adds a regexp matcher and the relevant bucket to use when
@@ -412,7 +434,8 @@ func (s *Server) getMetricMethodBucket(method string) string {
 // installed on both the unsecured and secured (TLS) servers.
 // NOTE: This method is maintained for backwards compatibility, but no new endpoints should be added
 // to this set. New handlers should be added under InstallAuthorizedHandlers.
-func (s *Server) InstallAuthNotRequiredHandlers() {
+func (s *Server) InstallAuthNotRequiredHandlers(ctx context.Context) {
+	logger := klog.FromContext(ctx)
 	s.addMetricsBucketMatcher("healthz")
 	checkers := []healthz.HealthChecker{
 		healthz.PingHealthz,
@@ -430,7 +453,9 @@ func (s *Server) InstallAuthNotRequiredHandlers() {
 		Path(podsPath).
 		Produces(restful.MIME_JSON)
 	ws.Route(ws.GET("").
-		To(s.getPods).
+		To(func(r1 *restful.Request, r2 *restful.Response) {
+			s.getPods(logger, r1, r2)
+		}).
 		Operation("getPods"))
 	s.restfulCont.Add(ws)
 
@@ -464,6 +489,7 @@ func (s *Server) InstallAuthNotRequiredHandlers() {
 	r.RawMustRegister(metrics.NewPrometheusMachineCollector(prometheusHostAdapter{s.host}, includedMetrics))
 	if utilfeature.DefaultFeatureGate.Enabled(features.PodAndContainerStatsFromCRI) {
 		r.CustomRegister(collectors.NewCRIMetricsCollector(context.TODO(), s.host.ListPodSandboxMetrics, s.host.ListMetricDescriptors))
+		servermetrics.SetMetricsProvider(servermetrics.CRIMetricsProvider)
 	} else {
 		cadvisorOpts := cadvisorv2.RequestOptions{
 			IdType:    cadvisorv2.TypeName,
@@ -471,6 +497,7 @@ func (s *Server) InstallAuthNotRequiredHandlers() {
 			Recursive: true,
 		}
 		r.RawMustRegister(metrics.NewPrometheusCollector(prometheusHostAdapter{s.host}, containerPrometheusLabelsFunc(s.host), includedMetrics, clock.RealClock{}, cadvisorOpts))
+		servermetrics.SetMetricsProvider(servermetrics.CAdvisorMetricsProvider)
 	}
 	s.restfulCont.Handle(cadvisorMetricsPath,
 		compbasemetrics.HandlerFor(r, compbasemetrics.HandlerOpts{ErrorHandling: compbasemetrics.ContinueOnError}),
@@ -501,16 +528,20 @@ func (s *Server) InstallAuthNotRequiredHandlers() {
 // InstallAuthRequiredHandlers registers the HTTP handlers that should only be installed on servers
 // with authorization enabled.
 // NOTE: New endpoints must require authorization.
-func (s *Server) InstallAuthRequiredHandlers() {
+func (s *Server) InstallAuthRequiredHandlers(ctx context.Context) {
+	logger := klog.FromContext(ctx)
 	s.addMetricsBucketMatcher("run")
 	ws := new(restful.WebService)
+	getRun := func(request *restful.Request, response *restful.Response) {
+		s.getRun(logger, request, response)
+	}
 	ws.
 		Path("/run")
 	ws.Route(ws.POST("/{podNamespace}/{podID}/{containerName}").
-		To(s.getRun).
+		To(getRun).
 		Operation("getRun"))
 	ws.Route(ws.POST("/{podNamespace}/{podID}/{uid}/{containerName}").
-		To(s.getRun).
+		To(getRun).
 		Operation("getRun"))
 	s.restfulCont.Add(ws)
 
@@ -580,18 +611,6 @@ func (s *Server) InstallAuthRequiredHandlers() {
 	s.addMetricsBucketMatcher("configz")
 	configz.InstallHandler(s.restfulCont)
 
-	if utilfeature.DefaultFeatureGate.Enabled(zpagesfeatures.ComponentStatusz) {
-		s.addMetricsBucketMatcher("statusz")
-		statusz.Install(s.restfulCont, ComponentKubelet, statusz.NewRegistry(compatibility.DefaultBuildEffectiveVersion()))
-	}
-
-	if utilfeature.DefaultFeatureGate.Enabled(zpagesfeatures.ComponentFlagz) {
-		if s.flagz != nil {
-			s.addMetricsBucketMatcher("flagz")
-			flagz.Install(s.restfulCont, ComponentKubelet, s.flagz)
-		}
-	}
-
 	// The /runningpods endpoint is used for testing only.
 	s.addMetricsBucketMatcher("runningpods")
 	ws = new(restful.WebService)
@@ -613,6 +632,9 @@ func (s *Server) InstallAuthRequiredHandlers() {
 			Operation("checkpoint"))
 		s.restfulCont.Add(ws)
 	}
+
+	// must be done last so all paths are included in /statusz
+	s.InstallZPages()
 }
 
 // InstallDebuggingDisabledHandlers registers the HTTP request patterns that provide better error message
@@ -842,14 +864,14 @@ func encodePods(pods []*v1.Pod) (data []byte, err error) {
 }
 
 // getPods returns a list of pods bound to the Kubelet and their spec.
-func (s *Server) getPods(request *restful.Request, response *restful.Response) {
+func (s *Server) getPods(logger klog.Logger, request *restful.Request, response *restful.Response) {
 	pods := s.host.GetPods()
 	data, err := encodePods(pods)
 	if err != nil {
 		response.WriteError(http.StatusInternalServerError, err)
 		return
 	}
-	writeJSONResponse(response, data)
+	writeJSONResponse(logger, response, data)
 }
 
 // getRunningPods returns a list of pods running on Kubelet. The list is
@@ -857,6 +879,7 @@ func (s *Server) getPods(request *restful.Request, response *restful.Response) {
 // by getPods, which is a set of desired pods to run.
 func (s *Server) getRunningPods(request *restful.Request, response *restful.Response) {
 	ctx := request.Request.Context()
+	logger := klog.FromContext(ctx)
 	pods, err := s.host.GetRunningPods(ctx)
 	if err != nil {
 		response.WriteError(http.StatusInternalServerError, err)
@@ -867,7 +890,7 @@ func (s *Server) getRunningPods(request *restful.Request, response *restful.Resp
 		response.WriteError(http.StatusInternalServerError, err)
 		return
 	}
-	writeJSONResponse(response, data)
+	writeJSONResponse(logger, response, data)
 }
 
 // getLogs handles logs requests against the Kubelet.
@@ -910,7 +933,10 @@ func getPortForwardRequestParams(req *restful.Request) portForwardRequestParams 
 type responder struct{}
 
 func (r *responder) Error(w http.ResponseWriter, req *http.Request, err error) {
-	klog.ErrorS(err, "Error while proxying request")
+	// Use context.TODO() because we currently do not have a proper context to pass in.
+	// Replace this with an appropriate context when refactoring this function to accept a context parameter.
+	logger := klog.FromContext(context.TODO())
+	logger.Error(err, "Error while proxying request")
 	http.Error(w, err.Error(), http.StatusInternalServerError)
 }
 
@@ -971,7 +997,7 @@ func (s *Server) getExec(request *restful.Request, response *restful.Response) {
 }
 
 // getRun handles requests to run a command inside a container.
-func (s *Server) getRun(request *restful.Request, response *restful.Response) {
+func (s *Server) getRun(logger klog.Logger, request *restful.Request, response *restful.Response) {
 	params := getExecRequestParams(request)
 	pod, ok := s.host.GetPodByName(params.podNamespace, params.podName)
 	if !ok {
@@ -986,11 +1012,11 @@ func (s *Server) getRun(request *restful.Request, response *restful.Response) {
 		response.WriteError(http.StatusInternalServerError, err)
 		return
 	}
-	writeJSONResponse(response, data)
+	writeJSONResponse(logger, response, data)
 }
 
 // Derived from go-restful writeJSON.
-func writeJSONResponse(response *restful.Response, data []byte) {
+func writeJSONResponse(logger klog.Logger, response *restful.Response, data []byte) {
 	if data == nil {
 		response.WriteHeader(http.StatusOK)
 		// do not write a nil representation
@@ -999,7 +1025,7 @@ func writeJSONResponse(response *restful.Response, data []byte) {
 	response.Header().Set(restful.HEADER_ContentType, restful.MIME_JSON)
 	response.WriteHeader(http.StatusOK)
 	if _, err := response.Write(data); err != nil {
-		klog.ErrorS(err, "Error writing response")
+		logger.Error(err, "Error writing response")
 	}
 }
 
@@ -1037,6 +1063,7 @@ func (s *Server) getPortForward(request *restful.Request, response *restful.Resp
 // to the runtime to actually checkpoint the container.
 func (s *Server) checkpoint(request *restful.Request, response *restful.Response) {
 	ctx := request.Request.Context()
+	logger := klog.FromContext(ctx)
 	pod, ok := s.host.GetPodByName(request.PathParameter("podNamespace"), request.PathParameter("podID"))
 	if !ok {
 		response.WriteError(http.StatusNotFound, fmt.Errorf("pod does not exist"))
@@ -1108,6 +1135,7 @@ func (s *Server) checkpoint(request *restful.Request, response *restful.Response
 		return
 	}
 	writeJSONResponse(
+		logger,
 		response,
 		[]byte(fmt.Sprintf("{\"items\":[\"%s\"]}", options.Location)),
 	)
@@ -1173,8 +1201,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	servermetrics.HTTPInflightRequests.WithLabelValues(method, path, serverType, longRunning).Inc()
 	defer servermetrics.HTTPInflightRequests.WithLabelValues(method, path, serverType, longRunning).Dec()
 
-	startTime := time.Now()
-	defer servermetrics.HTTPRequestsDuration.WithLabelValues(method, path, serverType, longRunning).Observe(servermetrics.SinceInSeconds(startTime))
+	// Use ObserveSince to ensure the duration is calculated when the defer executes,
+	// not when it's declared. In Go, arguments to deferred functions are evaluated
+	// immediately at the defer statement, which would cause the metric to record
+	// near-zero values (~2 microseconds) instead of actual request handling time.
+	defer servermetrics.HTTPRequestsDuration.ObserveSince(time.Now(), method, path, serverType, longRunning)()
 
 	handler.ServeHTTP(w, req)
 }

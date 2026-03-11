@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 /*
 Copyright 2024 The Kubernetes Authors.
@@ -21,6 +20,7 @@ limitations under the License.
 package nodeshutdown
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -36,7 +36,6 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
-	"k8s.io/kubernetes/pkg/kubelet/prober"
 	"k8s.io/kubernetes/pkg/windows/service"
 
 	"golang.org/x/sys/windows/registry"
@@ -52,13 +51,12 @@ const (
 
 // managerImpl has functions that can be used to interact with the Node Shutdown Manager.
 type managerImpl struct {
-	logger       klog.Logger
-	recorder     record.EventRecorder
-	nodeRef      *v1.ObjectReference
-	probeManager prober.Manager
+	logger   klog.Logger
+	recorder record.EventRecorder
+	nodeRef  *v1.ObjectReference
 
 	getPods        eviction.ActivePodsFunc
-	syncNodeStatus func()
+	syncNodeStatus func(context.Context)
 
 	nodeShuttingDownMutex sync.Mutex
 	nodeShuttingDownNow   bool
@@ -87,7 +85,6 @@ func NewManager(conf *Config) Manager {
 
 	manager := &managerImpl{
 		logger:         conf.Logger,
-		probeManager:   conf.ProbeManager,
 		recorder:       conf.Recorder,
 		nodeRef:        conf.NodeRef,
 		getPods:        conf.GetPodsFunc,
@@ -139,7 +136,7 @@ func (m *managerImpl) setMetrics() {
 }
 
 // Start starts the node shutdown manager and will start watching the node for shutdown events.
-func (m *managerImpl) Start() error {
+func (m *managerImpl) Start(_ context.Context) error {
 	m.logger.V(1).Info("Shutdown manager get started")
 
 	_, err := m.start()
@@ -250,7 +247,7 @@ func (m *managerImpl) ProcessShutdownEvent() error {
 	m.nodeShuttingDownNow = true
 	m.nodeShuttingDownMutex.Unlock()
 
-	go m.syncNodeStatus()
+	go m.syncNodeStatus(context.TODO())
 
 	m.logger.V(1).Info("Shutdown manager processing preshutdown event")
 	activePods := m.getPods()

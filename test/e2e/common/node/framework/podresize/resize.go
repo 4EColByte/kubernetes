@@ -23,10 +23,12 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	helpers "k8s.io/component-helpers/resource"
 	"k8s.io/kubectl/pkg/util/podutils"
 	kubeqos "k8s.io/kubernetes/pkg/kubelet/qos"
@@ -50,28 +52,6 @@ type ResizableContainerInfo struct {
 	RestartCount  int32
 	RestartPolicy v1.ContainerRestartPolicy
 	InitCtr       bool
-}
-
-type containerPatch struct {
-	Name      string `json:"name"`
-	Resources struct {
-		Requests struct {
-			CPU     string `json:"cpu,omitempty"`
-			Memory  string `json:"memory,omitempty"`
-			EphStor string `json:"ephemeral-storage,omitempty"`
-		} `json:"requests"`
-		Limits struct {
-			CPU     string `json:"cpu,omitempty"`
-			Memory  string `json:"memory,omitempty"`
-			EphStor string `json:"ephemeral-storage,omitempty"`
-		} `json:"limits"`
-	} `json:"resources"`
-}
-
-type patchSpec struct {
-	Spec struct {
-		Containers []containerPatch `json:"containers"`
-	} `json:"spec"`
 }
 
 func getTestResizePolicy(tcInfo ResizableContainerInfo) (resizePol []v1.ContainerResizePolicy) {
@@ -98,7 +78,7 @@ func makeResizableContainer(tcInfo ResizableContainerInfo) v1.Container {
 	return tc
 }
 
-func MakePodWithResizableContainers(ns, name, timeStamp string, tcInfo []ResizableContainerInfo) *v1.Pod {
+func MakePodWithResizableContainers(ns, name, timeStamp string, tcInfo []ResizableContainerInfo, podResources *v1.ResourceRequirements) *v1.Pod {
 	testInitContainers, testContainers := separateContainers(tcInfo)
 
 	minGracePeriodSeconds := int64(0)
@@ -118,6 +98,11 @@ func MakePodWithResizableContainers(ns, name, timeStamp string, tcInfo []Resizab
 			TerminationGracePeriodSeconds: &minGracePeriodSeconds,
 		},
 	}
+
+	if podResources != nil {
+		pod.Spec.Resources = podResources
+	}
+
 	return pod
 }
 
@@ -175,7 +160,7 @@ func VerifyPodResizePolicy(gotPod *v1.Pod, wantInfo []ResizableContainerInfo) {
 	}
 }
 
-func VerifyPodResources(gotPod *v1.Pod, wantInfo []ResizableContainerInfo) {
+func VerifyPodResources(gotPod *v1.Pod, wantInfo []ResizableContainerInfo, wantPodResources *v1.ResourceRequirements) {
 	ginkgo.GinkgoHelper()
 
 	gotCtrs := append(append([]v1.Container{}, gotPod.Spec.Containers...), gotPod.Spec.InitContainers...)
@@ -189,9 +174,11 @@ func VerifyPodResources(gotPod *v1.Pod, wantInfo []ResizableContainerInfo) {
 			if wantCtr.Name != gotCtr.Name {
 				continue
 			}
-			gomega.Expect(v1.Container{Name: gotCtr.Name, Resources: gotCtr.Resources}).To(gomega.Equal(v1.Container{Name: wantCtr.Name, Resources: wantCtr.Resources}))
+			gomega.Expect(gotCtr.Resources).To(gomega.BeComparableTo(wantCtr.Resources))
 		}
 	}
+	gomega.Expect(gotPod.Spec.Resources).To(gomega.BeComparableTo(wantPodResources))
+
 }
 
 func VerifyPodStatusResources(gotPod *v1.Pod, wantInfo []ResizableContainerInfo) error {
@@ -209,6 +196,18 @@ func VerifyPodStatusResources(gotPod *v1.Pod, wantInfo []ResizableContainerInfo)
 	return utilerrors.NewAggregate(errs)
 }
 
+func VerifyPodLevelStatusResources(gotPod *v1.Pod, wantPodResources *v1.ResourceRequirements) error {
+	var errs []error
+	if err := framework.Gomega().Expect(gotPod.Status.AllocatedResources).To(gomega.BeComparableTo(wantPodResources.Requests)); err != nil {
+		errs = append(errs, fmt.Errorf("pod[%s] status allocatedResources mismatch: %w", gotPod.Name, err))
+	}
+
+	if err := framework.Gomega().Expect(gotPod.Status.Resources).To(gomega.BeComparableTo(wantPodResources)); err != nil {
+		errs = append(errs, fmt.Errorf("pod[%s] status resources mismatch: %w", gotPod.Name, err))
+	}
+	return utilerrors.NewAggregate(errs)
+}
+
 func verifyPodContainersStatusResources(gotCtrStatuses []v1.ContainerStatus, wantCtrs []v1.Container) error {
 	ginkgo.GinkgoHelper()
 
@@ -223,12 +222,74 @@ func verifyPodContainersStatusResources(gotCtrStatuses []v1.ContainerStatus, wan
 			errs = append(errs, fmt.Errorf("container status %d name %q != expected name %q", i, gotCtrStatus.Name, wantCtr.Name))
 			continue
 		}
-		if err := framework.Gomega().Expect(*gotCtrStatus.Resources).To(gomega.Equal(wantCtr.Resources)); err != nil {
+
+		if err := framework.Gomega().Expect(gotCtrStatus.AllocatedResources).To(gomega.BeComparableTo(wantCtr.Resources.Requests)); err != nil {
+			errs = append(errs, fmt.Errorf("container[%s] status allocatedResources mismatch: %w", wantCtr.Name, err))
+		}
+
+		if err := framework.Gomega().Expect(*gotCtrStatus.Resources).To(gomega.BeComparableTo(wantCtr.Resources)); err != nil {
 			errs = append(errs, fmt.Errorf("container[%s] status resources mismatch: %w", wantCtr.Name, err))
 		}
 	}
 
 	return utilerrors.NewAggregate(errs)
+}
+
+func VerifyPodCgroupValues(ctx context.Context, f *framework.Framework, pod *v1.Pod) error {
+	aggregatedReqs, aggregatedLims := AggregateContainerResources(pod.Spec)
+	cpuReq := aggregatedReqs[v1.ResourceCPU]
+	cpuLim := aggregatedLims[v1.ResourceCPU]
+	memLim := aggregatedLims[v1.ResourceMemory]
+	if pod.Spec.Resources != nil {
+		cpuReq = pod.Spec.Resources.Requests[v1.ResourceCPU]
+		if pod.Spec.Resources.Limits != nil {
+			if podCPULim, found := pod.Spec.Resources.Limits[v1.ResourceCPU]; found {
+				cpuLim = podCPULim
+			}
+			if podMemLim, found := pod.Spec.Resources.Limits[v1.ResourceMemory]; found {
+				memLim = podMemLim
+			}
+		}
+	}
+
+	cgroupResources := &cgroups.ContainerResources{
+		CPUReq: cpuReq.String(),
+		MemLim: memLim.String(),
+		CPULim: cpuLim.String(),
+		// memory requests are not set in cgroup
+	}
+
+	return cgroups.VerifyPodCgroups(ctx, f, pod, cgroupResources)
+}
+
+func AggregateContainerResources(spec v1.PodSpec) (v1.ResourceList, v1.ResourceList) {
+	// Pre-allocate map memory based on the test's scope, as only
+	// 'cpu' and 'memory' resources will be tracked.
+	aggregatedReqs := make(v1.ResourceList, 2)
+	aggregatedLims := make(v1.ResourceList, 2)
+
+	for _, container := range spec.Containers {
+		addResourceList(aggregatedReqs, container.Resources.Requests)
+		addResourceList(aggregatedLims, container.Resources.Limits)
+	}
+
+	for _, container := range spec.InitContainers {
+		addResourceList(aggregatedReqs, container.Resources.Requests)
+		addResourceList(aggregatedLims, container.Resources.Limits)
+	}
+
+	return aggregatedReqs, aggregatedLims
+}
+
+// TODO: move this to a common helper method and re-use in pod-level resources
+// related tests
+func addResourceList(des, src v1.ResourceList) {
+	for name, quantity := range src {
+		if value, found := des[name]; found {
+			quantity.Add(value)
+		}
+		des[name] = quantity.DeepCopy()
+	}
 }
 
 func VerifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework, pod *v1.Pod, tcInfo []ResizableContainerInfo) error {
@@ -244,22 +305,22 @@ func VerifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 	return utilerrors.NewAggregate(errs)
 }
 
-func verifyPodRestarts(f *framework.Framework, pod *v1.Pod, wantInfo []ResizableContainerInfo) error {
+func verifyPodRestarts(ctx context.Context, f *framework.Framework, pod *v1.Pod, wantInfo []ResizableContainerInfo) error {
 	ginkgo.GinkgoHelper()
 
 	initCtrStatuses, ctrStatuses := separateContainerStatuses(wantInfo)
 	errs := []error{}
-	if err := verifyContainerRestarts(f, pod, pod.Status.InitContainerStatuses, initCtrStatuses); err != nil {
+	if err := verifyContainerRestarts(ctx, f, pod, pod.Status.InitContainerStatuses, initCtrStatuses); err != nil {
 		errs = append(errs, err)
 	}
-	if err := verifyContainerRestarts(f, pod, pod.Status.ContainerStatuses, ctrStatuses); err != nil {
+	if err := verifyContainerRestarts(ctx, f, pod, pod.Status.ContainerStatuses, ctrStatuses); err != nil {
 		errs = append(errs, err)
 	}
 
 	return utilerrors.NewAggregate(errs)
 }
 
-func verifyContainerRestarts(f *framework.Framework, pod *v1.Pod, gotStatuses []v1.ContainerStatus, wantStatuses []v1.ContainerStatus) error {
+func verifyContainerRestarts(ctx context.Context, f *framework.Framework, pod *v1.Pod, gotStatuses []v1.ContainerStatus, wantStatuses []v1.ContainerStatus) error {
 	ginkgo.GinkgoHelper()
 
 	if len(gotStatuses) != len(wantStatuses) {
@@ -272,7 +333,7 @@ func verifyContainerRestarts(f *framework.Framework, pod *v1.Pod, gotStatuses []
 		if gotStatus.RestartCount != wantStatuses[i].RestartCount {
 			errs = append(errs, fmt.Errorf("unexpected number of restarts for container %s: got %d, want %d", gotStatus.Name, gotStatus.RestartCount, wantStatuses[i].RestartCount))
 		} else if gotStatus.RestartCount > 0 {
-			if err := verifyOomScoreAdj(f, pod, gotStatus.Name); err != nil {
+			if err := verifyOomScoreAdj(ctx, f, pod, gotStatus.Name); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -280,7 +341,7 @@ func verifyContainerRestarts(f *framework.Framework, pod *v1.Pod, gotStatuses []
 	return utilerrors.NewAggregate(errs)
 }
 
-func verifyOomScoreAdj(f *framework.Framework, pod *v1.Pod, containerName string) error {
+func verifyOomScoreAdj(ctx context.Context, f *framework.Framework, pod *v1.Pod, containerName string) error {
 	container := e2epod.FindContainerInPod(pod, containerName)
 	if container == nil {
 		return fmt.Errorf("failed to find container %s in pod %s", containerName, pod.Name)
@@ -295,7 +356,9 @@ func verifyOomScoreAdj(f *framework.Framework, pod *v1.Pod, containerName string
 	oomScoreAdj := kubeqos.GetContainerOOMScoreAdjust(pod, container, int64(nodeMemoryCapacity.Value()))
 	expectedOomScoreAdj := strconv.FormatInt(int64(oomScoreAdj), 10)
 
-	return cgroups.VerifyOomScoreAdjValue(f, pod, container.Name, expectedOomScoreAdj)
+	return framework.Gomega().Eventually(ctx, framework.HandleRetry(func(ctx context.Context) (error, error) {
+		return cgroups.VerifyOomScoreAdjValue(f, pod, container.Name, expectedOomScoreAdj), nil
+	})).WithTimeout(framework.PollShortTimeout).Should(gomega.Succeed())
 }
 
 func WaitForPodResizeActuation(ctx context.Context, f *framework.Framework, podClient *e2epod.PodClient, pod *v1.Pod, expectedContainers []ResizableContainerInfo) *v1.Pod {
@@ -345,13 +408,39 @@ func ExpectPodResized(ctx context.Context, f *framework.Framework, resizedPod *v
 
 	// Verify Pod Containers Cgroup Values
 	var errs []error
+
+	onlyPLRSet := func(pod *v1.Pod) bool {
+		if pod.Spec.Resources == nil {
+			return false
+		}
+
+		for _, container := range pod.Spec.Containers {
+			if container.Resources.Requests != nil && container.Resources.Limits != nil {
+				return false
+			}
+		}
+		return true
+	}
+
+	if onlyPLRSet(resizedPod) {
+		// Wait for containers to start. Pods using only
+		// pod-level resources and undergoing container
+		// restarts experience a startup delay before
+		// cgroup metrics are available.
+		ginkgo.By("Waiting for cgroup reading")
+		const cgroupReadDelay = time.Second * 60
+		time.Sleep(cgroupReadDelay)
+	}
+
 	if cgroupErrs := VerifyPodContainersCgroupValues(ctx, f, resizedPod, expectedContainers); cgroupErrs != nil {
 		errs = append(errs, fmt.Errorf("container cgroup values don't match expected: %w", formatErrors(cgroupErrs)))
 	}
+
 	if resourceErrs := VerifyPodStatusResources(resizedPod, expectedContainers); resourceErrs != nil {
 		errs = append(errs, fmt.Errorf("container status resources don't match expected: %w", formatErrors(resourceErrs)))
 	}
-	if restartErrs := verifyPodRestarts(f, resizedPod, expectedContainers); restartErrs != nil {
+
+	if restartErrs := verifyPodRestarts(ctx, f, resizedPod, expectedContainers); restartErrs != nil {
 		errs = append(errs, fmt.Errorf("container restart counts don't match expected: %w", formatErrors(restartErrs)))
 	}
 
@@ -369,27 +458,17 @@ func ExpectPodResized(ctx context.Context, f *framework.Framework, resizedPod *v
 	}
 }
 
-// ResizeContainerPatch generates a patch string to resize the pod container.
-func ResizeContainerPatch(containers []ResizableContainerInfo) (string, error) {
-	var patch patchSpec
+func MakeResizePatch(originalContainers, desiredContainers []ResizableContainerInfo, originPodResources, desiredPodResources *v1.ResourceRequirements) []byte {
+	original, err := json.Marshal(MakePodWithResizableContainers("", "", "", originalContainers, originPodResources))
+	framework.ExpectNoError(err)
 
-	for _, container := range containers {
-		var cPatch containerPatch
-		cPatch.Name = container.Name
-		cPatch.Resources.Requests.CPU = container.Resources.CPUReq
-		cPatch.Resources.Requests.Memory = container.Resources.MemReq
-		cPatch.Resources.Limits.CPU = container.Resources.CPULim
-		cPatch.Resources.Limits.Memory = container.Resources.MemLim
+	desired, err := json.Marshal(MakePodWithResizableContainers("", "", "", desiredContainers, desiredPodResources))
+	framework.ExpectNoError(err)
 
-		patch.Spec.Containers = append(patch.Spec.Containers, cPatch)
-	}
+	patch, err := strategicpatch.CreateTwoWayMergePatch(original, desired, v1.Pod{})
+	framework.ExpectNoError(err)
 
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return "", err
-	}
-
-	return string(patchBytes), nil
+	return patch
 }
 
 // UpdateExpectedContainerRestarts updates the RestartCounts in expectedContainers by
@@ -401,6 +480,9 @@ func UpdateExpectedContainerRestarts(ctx context.Context, pod *v1.Pod, expectedC
 	initialRestarts := make(map[string]int32)
 	newExpectedContainers := []ResizableContainerInfo{}
 	for _, ctr := range pod.Status.ContainerStatuses {
+		initialRestarts[ctr.Name] = ctr.RestartCount
+	}
+	for _, ctr := range pod.Status.InitContainerStatuses {
 		initialRestarts[ctr.Name] = ctr.RestartCount
 	}
 	for i, ctr := range expectedContainers {

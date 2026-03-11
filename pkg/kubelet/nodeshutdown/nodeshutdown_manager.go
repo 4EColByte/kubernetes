@@ -33,7 +33,6 @@ import (
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
-	"k8s.io/kubernetes/pkg/kubelet/prober"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager"
 	"k8s.io/utils/clock"
 )
@@ -43,20 +42,19 @@ type Manager interface {
 	lifecycle.PodAdmitHandler
 
 	Admit(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult
-	Start() error
+	Start(ctx context.Context) error
 	ShutdownStatus() error
 }
 
 // Config represents Manager configuration
 type Config struct {
 	Logger                           klog.Logger
-	ProbeManager                     prober.Manager
 	VolumeManager                    volumemanager.VolumeManager
 	Recorder                         record.EventRecorder
 	NodeRef                          *v1.ObjectReference
 	GetPodsFunc                      eviction.ActivePodsFunc
 	KillPodFunc                      eviction.KillPodFunc
-	SyncNodeStatusFunc               func()
+	SyncNodeStatusFunc               func(context.Context)
 	ShutdownGracePeriodRequested     time.Duration
 	ShutdownGracePeriodCriticalPods  time.Duration
 	ShutdownGracePeriodByPodPriority []kubeletconfig.ShutdownGracePeriodByPodPriority
@@ -73,7 +71,7 @@ func (managerStub) Admit(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmit
 }
 
 // Start is a no-op always returning nil for non linux platforms.
-func (managerStub) Start() error {
+func (managerStub) Start(context.Context) error {
 	return nil
 }
 

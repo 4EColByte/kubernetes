@@ -29,6 +29,7 @@ package replicaset
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -61,7 +62,9 @@ import (
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/replicaset/metrics"
+	consistencyutil "k8s.io/kubernetes/pkg/controller/util/consistency"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 )
 
@@ -76,6 +79,17 @@ const (
 	// controllerUIDIndex is the name for the ReplicaSet store's index function,
 	// which is to index by ReplicaSet's controllerUID.
 	controllerUIDIndex = "controllerUID"
+)
+
+var (
+	replicaSetGroupResource = schema.GroupResource{
+		Group:    "apps",
+		Resource: "replicasets",
+	}
+	podGroupResource = schema.GroupResource{
+		Group:    "",
+		Resource: "pods",
+	}
 )
 
 // ReplicaSetController is responsible for synchronizing ReplicaSet objects stored
@@ -117,6 +131,10 @@ type ReplicaSetController struct {
 	// Controllers that need to be synced
 	queue workqueue.TypedRateLimitingInterface[string]
 
+	clock clock.PassiveClock
+
+	consistencyStore consistencyutil.ConsistencyStore
+
 	// Controller specific features; see ReplicaSetControllerFeatures for details.
 	controllerFeatures ReplicaSetControllerFeatures
 }
@@ -140,6 +158,32 @@ func NewReplicaSetController(ctx context.Context, rsInformer appsinformers.Repli
 	if err := metrics.Register(legacyregistry.Register); err != nil {
 		logger.Error(err, "unable to register metrics")
 	}
+
+	var consistencyStore consistencyutil.ConsistencyStore
+	var podWriteCallback func(pod *v1.Pod, rs *metav1.OwnerReference)
+	if utilfeature.DefaultFeatureGate.Enabled(features.StaleControllerConsistencyReplicaSet) {
+		consistencyStore = consistencyutil.NewConsistencyStore(map[schema.GroupResource]consistencyutil.LastSyncRVGetter{
+			podGroupResource:        podInformer.Informer().GetStore(),
+			replicaSetGroupResource: rsInformer.Informer().GetStore(),
+		})
+		podWriteCallback = func(pod *v1.Pod, rs *metav1.OwnerReference) {
+			if rs == nil {
+				return
+			}
+			consistencyStore.WroteAt(
+				types.NamespacedName{
+					Namespace: pod.Namespace,
+					Name:      rs.Name,
+				},
+				rs.UID,
+				podGroupResource,
+				pod.ResourceVersion,
+			)
+		}
+	} else {
+		consistencyStore = consistencyutil.NewNoopConsistencyStore()
+	}
+
 	return NewBaseController(logger, rsInformer, podInformer, kubeClient, burstReplicas,
 		apps.SchemeGroupVersion.WithKind("ReplicaSet"),
 		"replicaset_controller",
@@ -147,16 +191,18 @@ func NewReplicaSetController(ctx context.Context, rsInformer appsinformers.Repli
 		controller.RealPodControl{
 			KubeClient: kubeClient,
 			Recorder:   eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "replicaset-controller"}),
+			OnWrite:    podWriteCallback,
 		},
 		eventBroadcaster,
 		DefaultReplicaSetControllerFeatures(),
+		consistencyStore,
 	)
 }
 
 // NewBaseController is the implementation of NewReplicaSetController with additional injected
 // parameters so that it can also serve as the implementation of NewReplicationController.
 func NewBaseController(logger klog.Logger, rsInformer appsinformers.ReplicaSetInformer, podInformer coreinformers.PodInformer, kubeClient clientset.Interface, burstReplicas int,
-	gvk schema.GroupVersionKind, metricOwnerName, queueName string, podControl controller.PodControlInterface, eventBroadcaster record.EventBroadcaster, controllerFeatures ReplicaSetControllerFeatures) *ReplicaSetController {
+	gvk schema.GroupVersionKind, metricOwnerName, queueName string, podControl controller.PodControlInterface, eventBroadcaster record.EventBroadcaster, controllerFeatures ReplicaSetControllerFeatures, consistencyStore consistencyutil.ConsistencyStore) *ReplicaSetController {
 
 	rsc := &ReplicaSetController{
 		GroupVersionKind: gvk,
@@ -169,7 +215,9 @@ func NewBaseController(logger klog.Logger, rsInformer appsinformers.ReplicaSetIn
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: queueName},
 		),
+		clock:              clock.RealClock{},
 		controllerFeatures: controllerFeatures,
+		consistencyStore:   consistencyStore,
 	}
 
 	rsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -216,7 +264,7 @@ func NewBaseController(logger klog.Logger, rsInformer appsinformers.ReplicaSetIn
 	})
 	rsc.podLister = podInformer.Lister()
 	rsc.podListerSynced = podInformer.Informer().HasSynced
-	controller.AddPodControllerUIDIndexer(podInformer.Informer()) //nolint:errcheck
+	controller.AddPodControllerIndexer(podInformer.Informer()) //nolint:errcheck
 	rsc.podIndexer = podInformer.Informer().GetIndexer()
 	rsc.syncHandler = rsc.syncReplicaSet
 
@@ -232,21 +280,26 @@ func (rsc *ReplicaSetController) Run(ctx context.Context, workers int) {
 	rsc.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: rsc.kubeClient.CoreV1().Events("")})
 	defer rsc.eventBroadcaster.Shutdown()
 
-	defer rsc.queue.ShutDown()
-
 	controllerName := strings.ToLower(rsc.Kind)
 	logger := klog.FromContext(ctx)
 	logger.Info("Starting controller", "name", controllerName)
-	defer logger.Info("Shutting down controller", "name", controllerName)
 
-	if !cache.WaitForNamedCacheSync(rsc.Kind, ctx.Done(), rsc.podListerSynced, rsc.rsListerSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down controller", "name", controllerName)
+		rsc.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, rsc.podListerSynced, rsc.rsListerSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, rsc.worker, time.Second)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, rsc.worker, time.Second)
+		})
 	}
-
 	<-ctx.Done()
 }
 
@@ -396,6 +449,10 @@ func (rsc *ReplicaSetController) deleteRS(logger klog.Logger, obj interface{}) {
 
 	logger.V(4).Info("Deleting", "replicaSet", klog.KObj(rs))
 
+	rsc.consistencyStore.Clear(types.NamespacedName{
+		Namespace: rs.Namespace,
+		Name:      rs.Name,
+	}, rs.UID)
 	// Delete expectations for the ReplicaSet so if we create a new one with the same name it starts clean
 	rsc.expectations.DeleteExpectations(logger, key)
 
@@ -493,13 +550,14 @@ func (rsc *ReplicaSetController) updatePod(logger klog.Logger, old, cur interfac
 		// having its status updated with the newly available replica. For now, we can fake the
 		// update by resyncing the controller MinReadySeconds after the it is requeued because
 		// a Pod transitioned to Ready.
+		// If there are multiple pods with varying readiness times, we cannot correctly track it
+		// with the current queue. Further resyncs are attempted at the end of the syncReplicaSet
+		// function.
 		// Note that this still suffers from #29229, we are just moving the problem one level
 		// "closer" to kubelet (from the deployment to the replica set controller).
 		if !podutil.IsPodReady(oldPod) && podutil.IsPodReady(curPod) && rs.Spec.MinReadySeconds > 0 {
 			logger.V(2).Info("pod will be enqueued after a while for availability check", "duration", rs.Spec.MinReadySeconds, "kind", rsc.Kind, "pod", klog.KObj(oldPod))
-			// Add a second to avoid milliseconds skew in AddAfter.
-			// See https://github.com/kubernetes/kubernetes/issues/39785#issuecomment-279959133 for more info.
-			rsc.enqueueRSAfter(rs, (time.Duration(rs.Spec.MinReadySeconds)*time.Second)+time.Second)
+			rsc.enqueueRSAfter(rs, time.Duration(rs.Spec.MinReadySeconds)*time.Second)
 		}
 		return
 	}
@@ -691,42 +749,12 @@ func (rsc *ReplicaSetController) manageReplicas(ctx context.Context, activePods 
 	return nil
 }
 
-// getRSPods returns the Pods that a given RS should manage.
-func (rsc *ReplicaSetController) getRSPods(rs *apps.ReplicaSet, orphanedPods bool) ([]*v1.Pod, error) {
-	// Iterate over two keys:
-	//  The UID of the RS, which identifies Pods that are controlled by the RS.
-	//  The OrphanPodIndexKey, which helps identify orphaned Pods that are not currently managed by any controller,
-	//   but may be adopted later on if they have matching labels with the ReplicaSet.
-	podsForRS := []*v1.Pod{}
-
-	uidKeys := []string{string(rs.UID)}
-	if orphanedPods {
-		uidKeys = append(uidKeys, controller.OrphanPodIndexKey)
-	}
-
-	for _, key := range uidKeys {
-		podObjs, err := rsc.podIndexer.ByIndex(controller.PodControllerUIDIndex, key)
-		if err != nil {
-			return nil, err
-		}
-		for _, obj := range podObjs {
-			pod, ok := obj.(*v1.Pod)
-			if !ok {
-				utilruntime.HandleError(fmt.Errorf("unexpected object type in pod indexer: %v", obj))
-				continue
-			}
-			podsForRS = append(podsForRS, pod)
-		}
-	}
-	return podsForRS, nil
-}
-
 // syncReplicaSet will sync the ReplicaSet with the given key if it has had its expectations fulfilled,
 // meaning it did not expect to see any more of its pods created or deleted. This function is not meant to be
 // invoked concurrently with the same key.
 func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string) error {
 	logger := klog.FromContext(ctx)
-	startTime := time.Now()
+	startTime := rsc.clock.Now()
 	defer func() {
 		logger.V(4).Info("Finished syncing", "kind", rsc.Kind, "key", key, "duration", time.Since(startTime))
 	}()
@@ -735,9 +763,22 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 	if err != nil {
 		return err
 	}
+	rsNamespacedName := types.NamespacedName{Namespace: namespace, Name: name}
+	if err := rsc.consistencyStore.EnsureReady(rsNamespacedName); err != nil {
+		var consistencyErr *consistencyutil.ConsistencyError
+		if errors.As(err, &consistencyErr) {
+			metrics.ReplicaSetRequeueSkips.WithLabelValues(
+				consistencyErr.GroupResource.Group,
+				consistencyErr.GroupResource.Resource,
+			).Inc()
+		}
+		return err
+	}
+
 	rs, err := rsc.rsLister.ReplicaSets(namespace).Get(name)
 	if apierrors.IsNotFound(err) {
 		logger.V(4).Info("deleted", "kind", rsc.Kind, "key", key)
+		rsc.consistencyStore.Clear(rsNamespacedName, "")
 		rsc.expectations.DeleteExpectations(logger, key)
 		return nil
 	}
@@ -753,7 +794,7 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 	}
 
 	// List all pods indexed to RS UID and Orphan pods
-	allRSPods, err := rsc.getRSPods(rs, true)
+	allRSPods, err := controller.FilterPodsByOwner(rsc.podIndexer, &rs.ObjectMeta, rsc.Kind, true)
 	if err != nil {
 		return err
 	}
@@ -773,12 +814,14 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 	}
 
 	var manageReplicasErr error
-	var nextSyncInSeconds *int
+	var nextSyncDuration *time.Duration
 	if rsNeedsSync && rs.DeletionTimestamp == nil {
 		manageReplicasErr = rsc.manageReplicas(ctx, activePods, rs)
 	}
 	rs = rs.DeepCopy()
-	newStatus := calculateStatus(rs, activePods, terminatingPods, manageReplicasErr, rsc.controllerFeatures)
+	// Use the same time for calculating status and nextSyncDuration.
+	now := rsc.clock.Now()
+	newStatus := calculateStatus(rs, activePods, terminatingPods, manageReplicasErr, rsc.controllerFeatures, now)
 
 	// Always updates status as pods come up or die.
 	updatedRS, err := updateReplicaSetStatus(logger, rsc.kubeClient.AppsV1().ReplicaSets(rs.Namespace), rs, newStatus, rsc.controllerFeatures)
@@ -787,17 +830,28 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 		// Returning an error causes a requeue without forcing a hotloop
 		return err
 	}
+	rsc.consistencyStore.WroteAt(
+		types.NamespacedName{Name: rs.Name, Namespace: rs.Namespace},
+		rs.UID,
+		replicaSetGroupResource,
+		updatedRS.ResourceVersion,
+	)
 	if manageReplicasErr != nil {
 		return manageReplicasErr
 	}
-	// Resync the ReplicaSet after MinReadySeconds as a last line of defense to guard against clock-skew.
+	// Plan the next availability check as a last line of defense against queue preemption (we have one queue key for checking availability of all the pods)
+	// or early sync (see https://github.com/kubernetes/kubernetes/issues/39785#issuecomment-279959133 for more info).
 	if updatedRS.Spec.MinReadySeconds > 0 &&
-		updatedRS.Status.ReadyReplicas == *(updatedRS.Spec.Replicas) &&
-		updatedRS.Status.AvailableReplicas != *(updatedRS.Spec.Replicas) {
-		nextSyncInSeconds = ptr.To(int(updatedRS.Spec.MinReadySeconds))
+		updatedRS.Status.ReadyReplicas != updatedRS.Status.AvailableReplicas {
+		// Safeguard fallback to the .spec.minReadySeconds to ensure that we always end up with .status.availableReplicas updated.
+		nextSyncDuration = ptr.To(time.Duration(updatedRS.Spec.MinReadySeconds) * time.Second)
+		// Use the same point in time (now) for calculating status and nextSyncDuration to get matching availability for the pods.
+		if nextCheck := controller.FindMinNextPodAvailabilityCheck(activePods, updatedRS.Spec.MinReadySeconds, now, rsc.clock); nextCheck != nil {
+			nextSyncDuration = nextCheck
+		}
 	}
-	if nextSyncInSeconds != nil {
-		rsc.queue.AddAfter(key, time.Duration(*nextSyncInSeconds)*time.Second)
+	if nextSyncDuration != nil {
+		rsc.queue.AddAfter(key, *nextSyncDuration)
 	}
 	return nil
 }
